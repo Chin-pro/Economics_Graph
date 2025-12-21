@@ -1,68 +1,194 @@
+/* ------------------------------------------------------------
+   :root 代表整份文件的「根元素」(<html>)
+   這裡常用來放全站共用的「全域設定 / CSS 變數 / 字型」等。
+   ------------------------------------------------------------ */
 :root {
+  /* 預設字體家族：
+     - system-ui：優先使用作業系統預設 UI 字體（Windows/ macOS 都會很自然）
+     - 後面的 Avenir/Helvetica/Arial... 是 fallback（找不到就用下一個）
+   */
   font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+
+  /* 行高：文字每一行的高度比例（1.5 倍） -> 可讀性較好 */
   line-height: 1.5;
+
+  /* 預設字重：400 = normal */
   font-weight: 400;
 
+  /* ----------------------------------------------------------
+     color-scheme：告訴瀏覽器這個網站支援 light / dark
+     好處：
+     - 表單控制項（input/scrollbar）能自動配合深淺色
+     注意：它不是直接「切換顏色」，只是告知瀏覽器支援。
+     ---------------------------------------------------------- */
   color-scheme: light dark;
+
+  /* 預設文字顏色：rgba(255,255,255,0.87) 表示白色但稍微透明
+     在深色背景上比較柔和，不那麼刺眼 */
   color: rgba(255, 255, 255, 0.87);
+
+  /* 預設背景色：深灰 */
   background-color: #242424;
 
+  /* font-synthesis: none
+     這個設定會避免瀏覽器「自己合成」粗體/斜體（fake bold/italic）
+     有些字型沒有 bold/italic，瀏覽器會硬做，效果可能不好。
+  */
   font-synthesis: none;
+
+  /* text-rendering: optimizeLegibility
+     告訴瀏覽器偏向「可讀性」的字形渲染策略（可能做 kerning 等微調）
+     在某些瀏覽器上文字會更順眼。
+  */
   text-rendering: optimizeLegibility;
+
+  /* -webkit-font-smoothing / -moz-osx-font-smoothing
+     這兩個是平台相關的字體平滑設定：
+     - WebKit (Chrome/Safari) 的抗鋸齒優化
+     - macOS Firefox 的灰階平滑
+     讓文字看起來更細緻。
+  */
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* ------------------------------------------------------------
+   a：所有超連結 <a> 的預設樣式
+   ------------------------------------------------------------ */
 a {
+  /* 連結字重稍微加重（500）
+     讓連結比較醒目，但不會像 bold 那麼重 */
   font-weight: 500;
+
+  /* 連結顏色（藍紫色系） */
   color: #646cff;
+
+  /* text-decoration: inherit
+     讓 <a> 繼承父元素的 text-decoration（通常會讓底線不強制出現）
+     在很多 UI 設計中，連結常用顏色 + hover 表現，而不是一直有底線 */
   text-decoration: inherit;
 }
+
+/* ------------------------------------------------------------
+   a:hover：滑鼠移到連結上時
+   ------------------------------------------------------------ */
 a:hover {
+  /* hover 時顏色變深一點，提供互動回饋 */
   color: #535bf2;
 }
 
+/* ------------------------------------------------------------
+   body：整個頁面內容容器
+   Vite 模板常把 body 設成 flex 並置中，
+   讓首頁 demo 看起來像是「畫面中央有一張卡」。
+   ------------------------------------------------------------ */
 body {
+  /* 清掉瀏覽器預設 margin（很多瀏覽器 body 預設有 8px margin） */
   margin: 0;
+
+  /* display:flex：把 body 變成 flex 容器 */
   display: flex;
+
+  /* place-items: center
+     這是 CSS Grid 常用，但在 Flex 上也會被部分瀏覽器支援（實務上可用）
+     等價概念：align-items: center;
+     目的：在交叉軸置中（垂直置中）
+  */
   place-items: center;
+
+  /* min-width: 320px：最小寬度限制（避免太窄排版崩）
+     320px 是手機常見最小寬度基準 */
   min-width: 320px;
+
+  /* min-height: 100vh：最小高度 = 1 個視窗高度
+     目的：讓置中效果在整個視窗高度內成立 */
   min-height: 100vh;
 }
 
+/* ------------------------------------------------------------
+   h1：大標題
+   Vite template 的 demo 常用 h1 當主標題
+   ------------------------------------------------------------ */
 h1 {
+  /* 3.2em：相對於目前字體大小的 3.2 倍 */
   font-size: 3.2em;
+
+  /* line-height: 1.1：標題行高較小，讓大字看起來更緊湊 */
   line-height: 1.1;
 }
 
+/* ------------------------------------------------------------
+   button：按鈕的統一樣式（Vite demo 那顆按鈕）
+   ------------------------------------------------------------ */
 button {
+  /* 圓角 */
   border-radius: 8px;
+
+  /* 先給透明邊框，避免 hover 時加邊框造成按鈕尺寸跳動 */
   border: 1px solid transparent;
+
+  /* padding：上下 0.6em、左右 1.2em
+     em 會跟著字體大小變動 -> 更一致的比例 */
   padding: 0.6em 1.2em;
+
+  /* 字體大小 1em：跟父層一致 */
   font-size: 1em;
+
+  /* 字重稍加重 */
   font-weight: 500;
+
+  /* font-family: inherit：繼承全站字體（:root 的設定） */
   font-family: inherit;
+
+  /* 深色背景：按鈕本體底色 */
   background-color: #1a1a1a;
+
+  /* cursor: pointer：滑鼠移上去顯示手指 -> 表示可點擊 */
   cursor: pointer;
+
+  /* transition：讓 border-color 的變化更平滑（0.25 秒） */
   transition: border-color 0.25s;
 }
+
+/* button:hover：hover 時顯示邊框顏色（互動回饋） */
 button:hover {
   border-color: #646cff;
 }
+
+/* ------------------------------------------------------------
+   button:focus / button:focus-visible
+   - focus：鍵盤 tab 移到按鈕上
+   - focus-visible：瀏覽器判斷「真的需要顯示焦點」的情境（通常鍵盤操作）
+   這是可及性（accessibility）的關鍵
+   ------------------------------------------------------------ */
 button:focus,
 button:focus-visible {
+  /* outline：焦點外框，使用系統預設的 focus-ring 顏色 */
   outline: 4px auto -webkit-focus-ring-color;
 }
 
+/* ------------------------------------------------------------
+   @media (prefers-color-scheme: light)
+   這是「使用者系統偏好淺色模式」時套用的樣式
+   - 若系統是 Light Mode，會套用下面的覆蓋設定
+   - 若系統是 Dark Mode，就用上面 :root 的深色設定
+   ------------------------------------------------------------ */
 @media (prefers-color-scheme: light) {
   :root {
+    /* 淺色模式的文字顏色：深灰藍 */
     color: #213547;
+
+    /* 淺色模式的背景：白色 */
     background-color: #ffffff;
   }
+
   a:hover {
+    /* 淺色模式 hover 的連結顏色略不同 */
     color: #747bff;
   }
+
   button {
+    /* 淺色模式按鈕底色改成淺灰 */
     background-color: #f9f9f9;
   }
 }
