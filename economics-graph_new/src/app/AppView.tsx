@@ -12,12 +12,17 @@
 // 在 MVC 的語言裡：
 // - AppView 是「Composition Root」：負責把 MVC 物件組起來
 // - 它本身仍是 View，但也是 "wiring" 的地方
+//
+// 重要更新（React 18 / StrictMode 常見坑）
+// - subscribe 這種「副作用」不要放在 constructor
+// - 要放在 componentDidMount（確保元件真的 mounted 後才訂閱）
+// - 卸載時在 componentWillUnmount 取消訂閱
 // ------------------------------------------------------------
 
 import React from "react";
 
 // Model：保存參數 + 提供 econ compute
-import { ConsumerOptModel } from "../MVC/model/ConsumerOptModel";
+import { ConsumerOptModel, type ConsumerParams } from "../MVC/model/ConsumerOptModel";
 
 // Controller：接 UI 事件、更新 model、build scene、notify listeners
 import { ConsumerOptController } from "../MVC/controller/ConsumerOptController";
@@ -25,14 +30,18 @@ import { ConsumerOptController } from "../MVC/controller/ConsumerOptController";
 // GraphView：SVG 容器 + 訂閱 controller 更新 + renderer (SvgSceneView)
 import { ConsumerOptGraphView } from "../MVC/view/ConsumerOptGraphView";
 
+// ControlledSlider : 匯入拖曳條組件
+import { ControlledSlider } from "../common/ControlledSlider";
+
+
 // ------------------------------------------------------------
 // AppView 的 state：
 // - I：收入 slider 顯示用（UI state）
 // - a：alpha slider 顯示用（UI state）
 //
-// 這裡特別重要：你同時也在 Model 裡保存 I,a。
-// 所以「UI state」跟「Model state」會變成兩份。
-// 你目前用 subscribe 來同步它們（避免不同步）。
+// 注意：Model 內也有一份 I/a（Model state）
+// - slider 改變：AppView setState + controller 更新 model
+// - 拖曳點改變：controller 更新 model，並 notify，AppView 再 setState 同步 slider
 // ------------------------------------------------------------
 type State = {
   I: number;
@@ -40,13 +49,14 @@ type State = {
 };
 
 // ------------------------------------------------------------
-// React.Component<Props, State>
+// React.Component<Props, State> 
+//   => P : props 的型別；S : state 的型別
 // 你的 props 不需要任何東西，所以用 Record<string, never>
 // （代表：不允許有任何 props key）
 // ------------------------------------------------------------
 export default class AppView extends React.Component<
-  Record<string, never>,
-  State
+  Record<string, never>,  // props 型別
+  State                   // state 型別
 > {
   // ----------------------------------------------------------
   // controller / model：用 class fields 保存（不放在 state）
@@ -60,22 +70,27 @@ export default class AppView extends React.Component<
   // ----------------------------------------------------------
   // constructor：初始化 UI state、建立 MVC 物件、綁定事件、建立同步訂閱
   // ----------------------------------------------------------
-  constructor(props: Record<string, never>) {
+  constructor(props: Record<string, never>) {  // 組件傳入參數 props
     super(props);
 
-    // 1) 初始化 UI state（slider 顯示用）
-    this.state = { I: 20, a: 0.5 };
+    // 1) 初始化參數
+    const initialParameters: ConsumerParams = { I: 20, a: 0.5, px: 1, py: 1}
 
-    // 2) 固定價格（目前 px,py 常數）
-    //    你之後如果要價格 slider，就會變成 state + handler + controller.onPriceChange
-    const px = 1;
-    const py = 1;
+    // 2) 初始化 UI state（slider 顯示用）
+    this.state = { I: initialParameters.I, a: initialParameters.a };
 
     // 3) 建立 Model：把初始參數塞進去
     //    注意：Model 內部自己保存一份 params
-    this.model = new ConsumerOptModel({ I: 20, a: 0.5, px, py });
+    //    等價於:
+    //      " this.model = new ConsumerOptModel({ 
+    //          I: initialParameters.I, 
+    //          a: initialParameters.a, 
+    //          px: initialParameters.px, 
+    //          py: initialParameters.py
+    //        })"
+    this.model = new ConsumerOptModel(initialParameters);
 
-    // 4) 建立 Controller
+    // 4) 建立 Controller (協調 model、產 scene、通知 view)
     //    Controller 需要 innerW/innerH（內容區大小），以及 model
     //
     //    你這裡寫：
@@ -90,36 +105,38 @@ export default class AppView extends React.Component<
     //      拖曳的 pixel<->econ 會比例錯。
     //
     //    更乾淨做法：由 GraphView/或一個共用 LayoutConfig 統一產生 innerW/innerH。
+    // TODO: 建議抽到共用 LayoutConfig，避免 GraphView 改 margin/W/H 時不一致
     this.controller = new ConsumerOptController({
-      innerW: 520 - 40 - 20,
+      innerW: 520 - 40 - 20,   // 需要修改 Hard coding!!!
       innerH: 360 - 20 - 30,
       model: this.model,
     });
 
     // 5) bind：class component 綁定 this
     //    因為下面會把 handler 當 callback 傳給 onChange / subscribe
+    //    當 callback 傳遞時才不會 this=undefined
     this.handleIncomeChange = this.handleIncomeChange.bind(this);
     this.handleAlphaChange = this.handleAlphaChange.bind(this);
     this.handleAlphaFromController = this.handleAlphaFromController.bind(this);
-
-    // 6) 訂閱 controller：
-    //    目的：當 controller/model 因拖曳 opt 點而更新了 a，
-    //    AppView 的 slider UI 也要同步更新（否則 slider 會卡在舊值）
-    //
-    // ⚠️ 重要：你 controller 的 Listener 型別如果是 (scene: SceneOutput) => void，
-    //    那這裡訂閱的函式應該接收 scene 參數才一致。
-    //
-    // 你現在的 handleAlphaFromController() 沒有參數，
-    //    有些 TS 設定會允許（因為多的參數不一定要用），
-    //    但語意上容易混亂。
-    //
-    // 建議改成：handleAlphaFromController(scene: SceneOutput) { ... }
-    // 或者 Controller 提供另一種 subscribeParamsChanged(listener: () => void)
-    this.controller.subscribe(this.handleAlphaFromController);
   }
 
   // ----------------------------------------------------------
-  // componentWillUnmount：元件卸載時解除訂閱
+  // componentDidMount：(mounted 後才訂閱)
+  // 安全：確保組件真的出現在畫面上，避免組件尚未掛載即渲染
+  // this.setState({ I:p.I, a:p.a })：確保訂閱開始後，UI state 立刻跟
+  // model state 對齊，避免極端時序下不同步
+  // ----------------------------------------------------------
+  componentDidMount(){
+    this.controller.subscribe(this.handleAlphaFromController);
+
+    // 確保 mounted 後 UI state 跟 model params 完全一致
+    const p = this.model.getModelParams();
+    this.setState({ I:p.I, a:p.a });
+  }
+
+
+  // ----------------------------------------------------------
+  // componentWillUnmount：元件卸載時解除訂閱 (卸載前取消訂閱)
   // 避免 controller 還在 notify 時呼叫 setState，造成 memory leak 警告
   // ----------------------------------------------------------
   componentWillUnmount() {
@@ -138,7 +155,7 @@ export default class AppView extends React.Component<
   // 因為 controller 也可能更新 I（例如未來你允許拖曳預算線端點）
   // ----------------------------------------------------------
   private handleAlphaFromController() {
-    const p = this.model.getParams();
+    const p = this.model.getModelParams();
     this.setState({ a: p.a, I: p.I });
   }
 
@@ -148,9 +165,11 @@ export default class AppView extends React.Component<
   // 做兩件事：
   // 1) 更新 AppView 的 UI state（讓 slider 顯示正確）
   // 2) 通知 controller：更新 model + rebuild scene + notify view
+  // 
+  // e: React.ChangeEvent<HTMLInputElement>: 代表 e.target 是一個 HTMLInputElement
   // ----------------------------------------------------------
   private handleIncomeChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const nextI = Number(e.target.value);
+    const nextI = Number(e.currentTarget.value);
 
     // 更新 UI state（這會觸發 AppView render，使 UI 文字/slider 改變）
     this.setState({ I: nextI });
@@ -164,7 +183,7 @@ export default class AppView extends React.Component<
   // 同樣做 UI state + controller 更新
   // ----------------------------------------------------------
   private handleAlphaChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const nextA = Number(e.target.value);
+    const nextA = Number(e.currentTarget.value);
 
     this.setState({ a: nextA });
     this.controller.onAlphaChange(nextA);
@@ -178,11 +197,15 @@ export default class AppView extends React.Component<
   // 你目前 px/py 固定成 1，只顯示出來，不提供 slider
   // ----------------------------------------------------------
   render() {
-    const px = 1;
-    const py = 1;
+    // 設定 px/py ，使其永遠與 model 同步
+    const { px, py } = this.model.getModelParams();
+
+    // // 設定字體 (挪移到 index.css 去進行統一調整)
+    // const applySystemFont = 
+    //   '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SP Pro Display", "Helvetica Neue", Arial, sans-serif';
 
     return (
-      <div style={{ padding: 16 }}>
+      <div style={{ padding: 16 }}> {/* "{ padding: 16 }" 為一個 TS 物件 */}
         <h2>Consumer Optimum (Cobb-Douglas)</h2>
 
         {/* flex layout：左 slider、右圖 */}
@@ -191,13 +214,23 @@ export default class AppView extends React.Component<
             {/* Income slider */}
             <div style={{ marginBottom: 12 }}>
               <label>
-                Income I: {this.state.I}
-                <input
+                {/* Income I: {this.state.I} */}
+                {/* <input
                   type="range"
                   min={5}
                   max={60}
                   value={this.state.I}
                   onChange={this.handleIncomeChange}
+                /> */}
+                <ControlledSlider
+                  label="Income I"
+                  min={5}
+                  max={60}
+                  value={this.state.I}
+                  onChange={(nextI) => {
+                    this.setState({ I: nextI });
+                    this.controller.onIncomeChange(nextI);
+                  }}
                 />
               </label>
             </div>
@@ -205,14 +238,24 @@ export default class AppView extends React.Component<
             {/* alpha slider */}
             <div style={{ marginBottom: 12 }}>
               <label>
-                a (x exponent): {this.state.a.toFixed(2)}
-                <input
+                {/* <input
                   type="range"
                   min={0.1}
                   max={0.9}
                   step={0.01}
                   value={this.state.a}
                   onChange={this.handleAlphaChange}
+                /> */}
+                <ControlledSlider
+                  label="a (x exponent)"
+                  min={0.1}
+                  max={0.9}
+                  step={0.01}
+                  value={Number(this.state.a.toFixed(2))}
+                  onChange={(nextA) => {
+                    this.setState({ a: nextA });
+                    this.controller.onAlphaChange(nextA)
+                  }}
                 />
               </label>
             </div>
@@ -223,7 +266,12 @@ export default class AppView extends React.Component<
             </div>
           </div>
 
-          {/* GraphView：只需要 controller（因為它會向 controller 訂閱 scene 更新） */}
+          {/* 
+          GraphView：只需要 controller（因為它會向 controller 訂閱 scene 更新）
+              因為 GraphView 的責任是：
+                1.向 controller 訂閱 scene；
+                2.把 scene render 成 SVG 
+          */}
           <ConsumerOptGraphView controller={this.controller} />
         </div>
       </div>

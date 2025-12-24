@@ -41,23 +41,23 @@ export type ConsumerParams = {
 export class ConsumerOptModel {
   // private：外部不能直接改 this.params
   // 這是 OOP 的封裝：想改參數必須走 setIncome / setAlpha / setPrices
-  private params: ConsumerParams;
+  private ModelParams: ConsumerParams;
 
   // 建構子：接收初始參數
   constructor(initial: ConsumerParams) {
     // this.params = initial 也可以，但會直接保留 reference
     // 你用 {...initial} 代表「複製一份」，避免外部還握著同一個物件 reference
     // （保護封裝，避免外部偷偷改 initial 影響 model）
-    this.params = { ...initial };
+    this.ModelParams = { ...initial };
   }
 
   // ----------------------------------------------------------
-  // getParams：對外提供一份參數快照（snapshot）
+  // getModelParams：對外提供一份參數快照（snapshot）
   // ----------------------------------------------------------
-  getParams(): ConsumerParams {
+  getModelParams(): Readonly<ConsumerParams> {
     // 同樣用 {...this.params} 回傳複製品
     // 避免外部拿到 reference 之後直接改內容（破壞封裝）
-    return { ...this.params };
+    return { ...this.ModelParams };
   }
 
   // ----------------------------------------------------------
@@ -66,19 +66,19 @@ export class ConsumerOptModel {
   // ----------------------------------------------------------
 
   // 設定收入
-  setIncome(I: number) {
-    this.params.I = I;
+  setIncome(I: number): void {
+    this.ModelParams.I = I;
   }
 
   // 設定 alpha（x 的權重）
   setAlpha(a: number) {
-    this.params.a = a;
+    this.ModelParams.a = a;
   }
 
   // 設定兩個價格
   setPrices(px: number, py: number) {
-    this.params.px = px;
-    this.params.py = py;
+    this.ModelParams.px = px;
+    this.ModelParams.py = py;
   }
 
   // ----------------------------------------------------------
@@ -88,7 +88,7 @@ export class ConsumerOptModel {
 
   // computeBudget：計算預算線兩端點
   computeBudget() {
-    const p = this.params; // 取 params 的 reference（方便寫）
+    const p = this.ModelParams; // 取 params 的 reference（方便寫）
     // 丟進 lib 的純函式計算
     // 回傳通常是 {p1:{x,y}, p2:{x,y}}（經濟座標）
     return budgetLineEndpoints({ I: p.I, px: p.px, py: p.py });
@@ -96,17 +96,17 @@ export class ConsumerOptModel {
 
   // computeOptimum：計算 Cobb-Douglas 最適點
   computeOptimum() {
-    const p = this.params;
+    const p = this.ModelParams;
     // 回傳通常是 {x, y}（經濟座標）
     return cobbDouglasOptimum({ a: p.a, I: p.I, px: p.px, py: p.py });
   }
 
   // computeUtilityAt：給定任意 (x,y) 計算效用
-  // 注意：這裡的 x,y 是「經濟座標」，不是像素座標
-  computeUtilityAt(x: number, y: number) {
-    const p = this.params;
+  // 注意：這裡的 x,y 是「經濟座標」，不是像素座標 (xEcon, yEcon)
+  computeUtilityAt(xEcon: number, yEcon: number): number {
+    const p = this.ModelParams;
     // 回傳一個 number：U
-    return utilityCobbDouglas({ a: p.a, x, y });
+    return utilityCobbDouglas({ a: p.a, x: xEcon, y: yEcon });
   }
 
   // computeIndifferenceCurve：給定 U0，回傳無異曲線的取樣點
@@ -116,7 +116,7 @@ export class ConsumerOptModel {
   //
   // 回傳：Point[]（經濟座標點列）
   computeIndifferenceCurve(U0: number, xMin: number, xMax: number, n: number) {
-    const p = this.params;
+    const p = this.ModelParams;
     return indifferenceCurvePoints({ a: p.a, U0, xMin, xMax, n });
   }
 }

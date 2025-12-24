@@ -50,6 +50,10 @@ export class ConsumerOptController {
   //    - 只要參數變了（I/a），就 rebuildAndNotify 會把它更新
   private lastScene: SceneOutput | null;
 
+  // 5) lastViewport: 和 lastScene 同步的「同一份座標轉換器」
+  private lastViewport: Viewport | null;
+
+
   // ---------------------------
   // 建構子：注入依賴（Dependency Injection）
   // ---------------------------
@@ -70,6 +74,9 @@ export class ConsumerOptController {
 
     // 初始 scene 尚未生成（lazy build）
     this.lastScene = null;
+
+    // 初始 viewport 尚未生成（lazy build）
+    this.lastViewport = null;
   }
 
   // ---------------------------
@@ -120,6 +127,28 @@ export class ConsumerOptController {
   }
 
   // =========================================================
+  // getViewport：提供 View 使用（AxesView 會用）
+  // - 確保 viewport 永遠和 lastScene 同步
+  // =========================================================
+  getViewport(): Viewport {
+    // 若尚未 build，先確保 scene.viewport 被建立
+    if (!this.lastScene || !this.lastViewport) {
+      // buildScene 內會同步更新 this.lastViewport
+      const scene = this.buildScene();
+      this.lastScene = scene;
+    }
+
+    // 此時 lastViewport 一定存在 (若不存在表示 buildScene 忘了更新)
+    if (!this.lastViewport) {
+      // 保險: 理論上不會發生
+      this.lastViewport = new Viewport(this.innerW, this.innerH, [0,1], [0,1]);
+    }
+
+    return this.lastViewport;
+  }
+
+
+  // =========================================================
   // UI events (from View)
   // 這些方法都是「View 事件入口」
   // =========================================================
@@ -142,27 +171,35 @@ export class ConsumerOptController {
   // - id: 哪一個點（你的 drawables 中 point 的 id）
   // - pixel: 使用者當下拖曳的局部座標（在內容區 <g> 裡）
   onPointDrag(id: string, pixel: { x: number; y: number }) {
+    // Debug
+    // console.log("[Controller] onPointDrag", id, pixel);
+    
     // 目前你只允許拖 opt 這個點
     // 其他點拖了也忽略（直接 return）
     if (id !== "opt") {
       return;
     }
 
-    // 先取得當前 scene（可能是 cache）
-    const scene = this.getScene();
+    // // 先取得當前 scene（可能是 cache）
+    // const scene = this.getScene();
 
-    // 用當前 scene 的 domain 建立 viewport
-    // 這步很重要：因為 domain 會隨 I/px/py 改變，不能用舊 domain
-    const vp = new Viewport(
-      this.innerW,
-      this.innerH,
-      scene.xDomain,
-      scene.yDomain
-    );
+    // // 用當前 scene 的 domain 建立 viewport
+    // // 這步很重要：因為 domain 會隨 I/px/py 改變，不能用舊 domain
+    // const vp = new Viewport(
+    //   this.innerW,
+    //   this.innerH,
+    //   scene.xDomain,
+    //   scene.yDomain
+    // );
+
+    // 不再 new Viewport，直接用「controller 當前的 viewport」
+    const vp = this.getViewport();
 
     // 像素座標 -> 經濟座標
     // 使用者拖曳的是 pixel，但你的經濟模型應該接 econ(x,y)
-    const econ = vp.unmap(pixel);
+    const econPoint = vp.pixelToEconMapping(pixel);
+    const xEcon = econPoint.x;
+    const yEcon = econPoint.y;
 
     // ---------------------------------------------------------
     // 關鍵：拖 opt 點要怎麼「回推 a」？
@@ -170,15 +207,15 @@ export class ConsumerOptController {
     // 你註解寫得很實在：有很多種定義方式
     //
     // 你現在採用的是一個簡單 proxy：
-    //   a ≈ x / (x + y)
+    //   alpha ≈ x / (x + y)
     //
     // 解釋：
-    // - a 在 Cobb-Douglas 裡是「x 的權重」
+    // - alpha 在 Cobb-Douglas 裡是「x 的權重」
     // - 拖到越靠右（x 大），a 就越大
     // - 拖到越靠上（y 大），a 就越小
     //
     // 這不是嚴格從 FOC 推回來的，但互動上直觀。
-    const denom = econ.x + econ.y;
+    const denom = xEcon + yEcon;
 
     // 防呆：避免 denom <= 0 時除以 0 或得到奇怪值
     if (denom <= 0) {
@@ -186,20 +223,20 @@ export class ConsumerOptController {
     }
 
     // 計算新的 a
-    let nextA = econ.x / denom;
+    let nextAlpha = xEcon / denom;
 
     // clamp：限制 a 的範圍到 [0.1, 0.9]
     // 因為 a=0 或 1 會讓 indifference curve / 效用等出現數值問題
     // （例如 1/(1-a) 會爆掉）
-    if (nextA < 0.1) {
-      nextA = 0.1;
+    if (nextAlpha < 0.1) {
+      nextAlpha = 0.1;
     }
-    if (nextA > 0.9) {
-      nextA = 0.9;
+    if (nextAlpha > 0.9) {
+      nextAlpha = 0.9;
     }
 
     // 更新 model 的 a
-    this.model.setAlpha(nextA);
+    this.model.setAlpha(nextAlpha);
 
     // 重建 scene + 通知 view（讓圖重畫、slider 也能同步）
     this.rebuildAndNotify();
@@ -216,8 +253,11 @@ export class ConsumerOptController {
   // - scene 必須更新
   // - view 必須被通知重新 render
   private rebuildAndNotify() {
-    // 重算並覆蓋快取
+    // 重算並覆蓋快取 (buildScene 會同步更新 lastViewport)
     this.lastScene = this.buildScene();
+
+    // 用 local 變數避免 TS 對 null 抱怨，也避免通知時被改動
+    const scene = this.lastScene;
 
     // 逐一通知 listener
     // listener 通常會 setState({scene}) 或同步 slider state 等
@@ -225,10 +265,7 @@ export class ConsumerOptController {
     while (i < this.listeners.length) {
       const fn = this.listeners[i];
 
-      // 注意：this.lastScene 在上面已經確保不是 null
-      // 但型別上仍是 SceneOutput | null，所以這裡 TS 可能會抱怨
-      // （如果你遇到型別抱怨，解法是用 local 變數 scene 存一次）
-      fn(this.lastScene);
+      fn(scene);
 
       i += 1;
     }
@@ -240,42 +277,45 @@ export class ConsumerOptController {
   // 但 MVC/OOP 版本把它放進 controller（或你也可以拆成 SceneBuilder class）
   private buildScene(): SceneOutput {
     // 取得 model 當前參數（I, px, py, a）
-    const p = this.model.getParams();
+    const p = this.model.getModelParams();
 
     // 決定經濟座標最大範圍（多留 20% 邊界）
-    const xMax = (p.I / p.px) * 1.2;
-    const yMax = (p.I / p.py) * 1.2;
+    const xEconMax = (p.I / p.px) * 1.2;
+    const yEconMax = (p.I / p.py) * 1.2;
 
     // 建立 viewport：經濟座標 -> 像素座標
-    const vp = new Viewport(this.innerW, this.innerH, [0, xMax], [0, yMax]);
+    const vp = new Viewport(this.innerW, this.innerH, [0, xEconMax], [0, yEconMax]);
+    this.lastViewport = vp;  // 同步更新 lastViewport
 
     // 由 model 計算經濟元素
     const budget = this.model.computeBudget();     // 預算線端點（經濟座標）
-    const opt = this.model.computeOptimum();       // 最適點（經濟座標）
-    const U0 = this.model.computeUtilityAt(opt.x, opt.y); // 最適效用
+    const optEcon = this.model.computeOptimum();       // 最適點（經濟座標）
+    const xEcon = optEcon.x;
+    const yEcon = optEcon.y;
+    const U0 = this.model.computeUtilityAt(xEcon, yEcon); // 最適效用
 
     // 無異曲線取樣的 xMin：避免 x 太小造成 y 爆掉
-    const xMinCandidate = xMax * 0.05;
+    const xMinCandidate = xEconMax * 0.05;
     let xMin = 0.0001;
     if (xMinCandidate > xMin) {
       xMin = xMinCandidate;
     }
 
     // 取樣無異曲線（回傳 econ 點）
-    const curveEconPts = this.model.computeIndifferenceCurve(U0, xMin, xMax, 60);
+    const curveEconPts = this.model.computeIndifferenceCurve(U0, xMin, xEconMax, 60);
 
     // econ -> pixel（line/polyline/point 都要 pixel 才能畫）
-    const curvePxPts = curveEconPts.map((pt) => vp.map(pt));
-    const optPx = vp.map(opt);
+    const curvePxPts = curveEconPts.map((pt) => vp.econToPixelMapping(pt));
+    const optPx = vp.econToPixelMapping(optEcon);
 
-    // 組裝 drawables：這就是 View 的「唯一輸入」
+    // 組裝 drawables：這就是 View 的「唯一輸入」（這就是 drawables.ts 的用途）
     const drawables: Drawable[] = [
       // 預算線：line
       {
         kind: "line",
         id: "budget",
-        a: vp.map(budget.p1), // 端點轉成像素座標
-        b: vp.map(budget.p2),
+        a: vp.econToPixelMapping(budget.p1), // 端點轉成像素座標
+        b: vp.econToPixelMapping(budget.p2),
         stroke: { width: 2, color: "currentColor" },
       },
       // 無異曲線：polyline
@@ -303,13 +343,23 @@ export class ConsumerOptController {
       },
     ];
 
+    // TEST: 額外加一個紅色點
+    // drawables.push({
+    //   kind: "point",
+    //   id: "test",
+    //   center: { x: 50, y: 50 },
+    //   r: 6,
+    //   fill: { color: "red" },
+    // });
+
+
     // 回傳 SceneOutput
     return {
       width: this.innerW,
       height: this.innerH,
       drawables,
-      xDomain: [0, xMax],
-      yDomain: [0, yMax],
+      xDomain: [0, xEconMax],
+      yDomain: [0, yEconMax],
     };
   }
 }

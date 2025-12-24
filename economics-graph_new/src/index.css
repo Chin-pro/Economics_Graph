@@ -3,11 +3,16 @@
    這裡常用來放全站共用的「全域設定 / CSS 變數 / 字型」等。
    ------------------------------------------------------------ */
 :root {
-  /* 預設字體家族：
-     - system-ui：優先使用作業系統預設 UI 字體（Windows/ macOS 都會很自然）
-     - 後面的 Avenir/Helvetica/Arial... 是 fallback（找不到就用下一個）
-   */
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  /* 全站預設字體家族（Apple 系統字體優先）
+     說明：
+     - -apple-system：Safari / iOS / macOS 的系統字體（San Francisco）
+     - BlinkMacSystemFont：Chrome 在 macOS 的系統字體入口
+     - "SF Pro Text" / "SF Pro Display"：Apple 字體家族（若存在則用）
+     - system-ui：各平台的系統 UI 字體 fallback（Windows 會落到 Segoe UI）
+     - 後面是通用 fallback
+  */
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    system-ui, "Helvetica Neue", Arial, sans-serif;
 
   /* 行高：文字每一行的高度比例（1.5 倍） -> 可讀性較好 */
   line-height: 1.5;

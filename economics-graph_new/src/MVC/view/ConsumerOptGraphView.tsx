@@ -33,6 +33,9 @@ import type { SceneOutput } from "../../core/drawables";
 // Controller：GraphView 需要一個 controller 來取得 scene、訂閱更新、轉交拖曳事件
 import { ConsumerOptController } from "../controller/ConsumerOptController";
 
+// GraphView: GraphView 的 state 也保存 viewport
+import { Viewport } from "../../core/Viewport";
+
 // ------------------------------------------------------------
 // Props：外部（通常是 AppView）必須傳入 controller
 // GraphView 不自己 new controller，避免把依賴鎖死
@@ -45,9 +48,11 @@ type Props = {
 // State：GraphView 自己持有目前的 scene
 // 這是 React class component 的典型模式：
 // - scene 變了 -> setState -> render 重新執行 -> 重畫 SVG
+// Viewport: 確保 Viewport 與 scene 同步
 // ------------------------------------------------------------
 type State = {
   scene: SceneOutput;
+  viewport: Viewport;
 };
 
 // ------------------------------------------------------------
@@ -58,15 +63,17 @@ type State = {
 // ------------------------------------------------------------
 export class ConsumerOptGraphView extends React.Component<Props, State> {
   // ----------------------------------------------------------
-  // 固定的「視圖配置」：W/H/margin
+  // 固定的「視圖配置」：svgWidth/svgHeight/svgMargin
   //
   // 用 private readonly：
-//  - private：外部不能直接改（封裝）
-//  - readonly：建構後不可變（避免 render 期間被改動）
-// ----------------------------------------------------------
-  private readonly W: number;
-  private readonly H: number;
-  private readonly margin: Margin;
+  //  - private：外部不能直接改（封裝）
+  //  - readonly：建構後不可變（避免 render 期間被改動）
+  // ----------------------------------------------------------
+  private readonly svgWidth: number;
+  private readonly svgHeight: number;
+  private readonly svgMargin: Margin;
+
+  private subscribedController: ConsumerOptController | null;
 
   // ----------------------------------------------------------
   // constructor：初始化 view 的常數、state、事件綁定、訂閱 controller
@@ -75,12 +82,17 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     super(props); // 必須呼叫 super(props)，讓 React 初始化 Component
 
     // SVG 外框尺寸（整張畫布）
-    this.W = 520;
-    this.H = 360;
+    this.svgWidth = 520;
+    this.svgHeight = 360;
 
     // 留白：讓座標軸 / 標籤可以放得下
-    // 內容區（inner）就是扣掉 margin 後的範圍
-    this.margin = { top: 20, right: 20, bottom: 30, left: 40 };
+    // 內容區（inner）就是扣掉 margin 後的範圍，中間那塊「真正拿來畫圖的區域」
+    //  - innerW = W - margin.left - margin.right
+    //  - innerH = H - margin.top - margin.bottom
+    // 為甚麼要留白?
+    //  - 左邊要放 Y 軸的數字（刻度文字），不留白會被切掉
+    //  - 下方要放 X 軸的數字，不留白會被切掉
+    this.svgMargin = { top: 20, right: 20, bottom: 30, left: 40 };
 
     // --------------------------------------------------------
     // 初始化 state.scene
@@ -88,7 +100,9 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     // - getScene() 內部可能會 lazy build
     // - 結果存進 state，第一次 render 就能畫出來
     // --------------------------------------------------------
-    this.state = { scene: props.controller.getScene() };
+    const scene = props.controller.getScene();
+    const viewport = props.controller.getViewport();
+    this.state = { scene, viewport };
 
     // --------------------------------------------------------
     // 綁定 this（class component 必做）
@@ -102,7 +116,7 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     this.handlePointDrag = this.handlePointDrag.bind(this);
 
     // --------------------------------------------------------
-    // ✅ 訂閱 controller：這就是你前面問的「訂閱者」！
+    // 訂閱 controller：這就是你前面問的「訂閱者」！
     //
     // 你把一個 callback（handleSceneUpdate）交給 controller，
     // controller 之後每次重算 scene 都會呼叫這個 callback(scene)。
@@ -111,8 +125,35 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     // - 訂閱者（listener）= this.handleSceneUpdate 這個函式
     // - 擁有者 = GraphView（View 層）
     // --------------------------------------------------------
-    props.controller.subscribe(this.handleSceneUpdate);
+    // props.controller.subscribe(this.handleSceneUpdate);
+    this.subscribedController = null;
   }
+
+  // ----------------------------------------------------------
+  // componentDidMount：元件要卸載時解除訂閱
+  //
+  // 為什麼一定要做？ 
+  // 訂閱 controller：這就是你前面問的「訂閱者」！
+  //
+  // 你把一個 callback（handleSceneUpdate）交給 controller，
+  // controller 之後每次重算 scene 都會呼叫這個 callback(scene)。
+  //
+  // 所以：
+  // - 訂閱者（listener）= this.handleSceneUpdate 這個函式
+  // - 擁有者 = GraphView（View 層）
+
+  // ----------------------------------------------------------
+  componentDidMount() {
+    this.subscribedController = this.props.controller;
+    this.subscribedController.subscribe(this.handleSceneUpdate);
+
+    // mount 後再同步一次 scene + viewport
+    // 確保 mount 之後 scene 是最新的 state (避免 mount 前 controller 已經更新)
+    const scene = this.props.controller.getScene();
+    const viewport = this.props.controller.getViewport();
+    this.setState({ scene, viewport });
+  }
+
 
   // ----------------------------------------------------------
   // componentWillUnmount：元件要卸載時解除訂閱
@@ -122,18 +163,29 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
   // - 元件都消失了，controller 還呼叫 setState -> 會警告/記憶體洩漏
   // ----------------------------------------------------------
   componentWillUnmount() {
-    this.props.controller.unsubscribe(this.handleSceneUpdate);
+    // this.props.controller.unsubscribe(this.handleSceneUpdate);
+
+    // 用當初訂閱的 controller 解除
+     if (this.subscribedController) {
+      this.subscribedController.unsubscribe(this.handleSceneUpdate);
+      this.subscribedController = null;
+     }
   }
 
   // ----------------------------------------------------------
-  // handleSceneUpdate：controller 通知我「新 scene」時會呼叫
+  // handleSceneUpdate：controller 通知「新 (lastest) scene」時會呼叫
   //
   // - 這個 method 會 setState
   // - setState 會觸發 render
   // - render 會把新 scene 丟進 SvgSceneView 重畫
+  // 
+  // - scene 更新時，也同步更新 viewport
   // ----------------------------------------------------------
   private handleSceneUpdate(scene: SceneOutput) {
-    this.setState({ scene });
+    const ctrl = this.subscribedController ? this.subscribedController : this.props.controller;
+    const viewport = ctrl.getViewport();
+
+    this.setState({ scene, viewport });
   }
 
   // ----------------------------------------------------------
@@ -144,6 +196,9 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
   // - controller 決定要怎麼處理（例如回推 a、重算 scene、通知 view）
   // ----------------------------------------------------------
   private handlePointDrag(id: string, pixel: { x: number; y: number }) {
+    // Debug
+    // console.log("[GraphView] onPointDrag", id, pixel);
+
     this.props.controller.onPointDrag(id, pixel);
   }
 
@@ -155,22 +210,33 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     // - 用於座標軸長度、Viewport 寬高
     // - 注意：這裡 GraphView 算 innerW/innerH，Controller 也要一致
     //   否則拖曳 pixel<->econ 轉換會出現比例差
-    const innerW = this.W - this.margin.left - this.margin.right;
-    const innerH = this.H - this.margin.top - this.margin.bottom;
+    
+    // scene / viewport 都從 state 取 (確保一致)
+    const scene = this.state.scene;
+    const viewport = this.state.viewport;
 
     return (
       // SVG 外框：畫布容器
-      <svg width={this.W} height={this.H} style={{ border: "1px solid #ddd" }}>
+      <svg width={this.svgWidth} height={this.svgHeight} style={{ border: "1px solid #ddd" }}>
         {/* AxesView 自己會 translate(margin.left, margin.top) */}
-        <AxesView width={innerW} height={innerH} margin={this.margin} />
+        <AxesView 
+          // width={innerW} 
+          // height={innerH} 
+          // xDomain={scene.xDomain}
+          // yDomain={scene.yDomain}
+          viewport = {viewport}
 
-        {/* 內容區的群組 <g>：把 (0,0) 移到內容區左上角 */}
-        <g transform={`translate(${this.margin.left},${this.margin.top})`}>
+          margin={this.svgMargin}           
+          ticks={5}
+        />
+
+        {/* 內容區的群組 <g>：把「畫圖原點 (0,0)」從整張 SVG 的左上角，搬到內容區的左上角 */}
+        <g transform={`translate(${this.svgMargin.left},${this.svgMargin.top})`}>
           {/* SvgSceneView：吃 scene.drawables 畫出 budget/indiff/opt/text
               同時把拖曳事件回報給 GraphView */}
           <SvgSceneView
-            scene={this.state.scene}
-            onPointDrag={this.handlePointDrag}
+            scene={scene} // Parent Component => Child Component
+            onPointDrag={this.handlePointDrag}  // Child Component => Parent Component
           />
         </g>
       </svg>
