@@ -36,6 +36,12 @@ import { ConsumerOptController } from "../controller/ConsumerOptController";
 // GraphView: GraphView 的 state 也保存 viewport
 import { Viewport } from "../../core/Viewport";
 
+
+// ------------------------------------------------------------
+// ALLOWED_TICKS: 限制 ticks 值: 避免奇怪數字 (1, 2, 4, 5, 10)
+// ------------------------------------------------------------
+const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10]; 
+
 // ------------------------------------------------------------
 // Props：外部（通常是 AppView）必須傳入 controller
 // GraphView 不自己 new controller，避免把依賴鎖死
@@ -53,6 +59,10 @@ type Props = {
 type State = {
   scene: SceneOutput;
   viewport: Viewport;
+
+  ticks: number;
+  showTickLines: boolean;
+  showTickLabels: boolean;
 };
 
 // ------------------------------------------------------------
@@ -74,6 +84,15 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
   private readonly svgMargin: Margin;
 
   private subscribedController: ConsumerOptController | null;
+
+
+  // // handlers for Tick
+  // private handleOnTicksChange: (e: React.ChangeEvent<HTMLSelectElement>) => void;
+  // private handleOnShowTickLinesChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  // private handleOnShowTickLabelsChange: (e: React.ChangeEvent<HTMLElement>) => void;
+
+
+
 
   // ----------------------------------------------------------
   // constructor：初始化 view 的常數、state、事件綁定、訂閱 controller
@@ -102,7 +121,13 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     // --------------------------------------------------------
     const scene = props.controller.getScene();
     const viewport = props.controller.getViewport();
-    this.state = { scene, viewport };
+    this.state = { 
+      scene, 
+      viewport,
+      ticks: 5,
+      showTickLines: true,
+      showTickLabels: true,
+    };
 
     // --------------------------------------------------------
     // 綁定 this（class component 必做）
@@ -114,6 +139,11 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     // --------------------------------------------------------
     this.handleSceneUpdate = this.handleSceneUpdate.bind(this);
     this.handlePointDrag = this.handlePointDrag.bind(this);
+
+    // bind Tick handlers
+    this.handleOnTicksChange = this.handleOnTicksChange.bind(this);
+    this.handleOnShowTickLinesChange = this.handleOnShowTickLinesChange.bind(this);
+    this.handleOnShowTickLabelsChange = this.handleOnShowTickLabelsChange.bind(this);
 
     // --------------------------------------------------------
     // 訂閱 controller：這就是你前面問的「訂閱者」！
@@ -202,6 +232,44 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     this.props.controller.onPointDrag(id, pixel);
   }
 
+
+  // ----------------------------------------------------------
+  // UI：ticks 下拉選單
+  // - 只允許 ALLOWED_TICKS 內的值
+  // ----------------------------------------------------------
+  private handleOnTicksChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    const raw = Number(e.currentTarget.value);
+
+    // 防呆: 確保一定是允許值
+    let allowedTicksValue = false;
+    let i = 0;
+    while (i < ALLOWED_TICKS.length) {
+      if (ALLOWED_TICKS[i] === raw) {
+        allowedTicksValue = true;
+      }
+      i++;
+    }
+
+    if (allowedTicksValue) {
+      this.setState({ ticks: raw });
+    }
+  }
+
+  // ----------------------------------------------------------
+  // UI：控制刻度短線
+  // ----------------------------------------------------------
+  private handleOnShowTickLinesChange(e: React.ChangeEvent<HTMLInputElement>) {
+    this.setState({ showTickLines: e.currentTarget.checked });
+  }
+
+  // ----------------------------------------------------------
+  // UI：控制刻度文字
+  // ----------------------------------------------------------
+  private handleOnShowTickLabelsChange(e: React.ChangeEvent<HTMLInputElement>) {
+    this.setState({ showTickLabels: e.target.checked });
+  }
+
+
   // ----------------------------------------------------------
   // render：把目前 state.scene 畫出來
   // ----------------------------------------------------------
@@ -215,31 +283,76 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     const scene = this.state.scene;
     const viewport = this.state.viewport;
 
+    // 組合 tickVisibility 傳給 AxesView
+    const tickVisibility = {
+      showTickLines: this.state.showTickLines,
+      showTickLabels: this.state.showTickLabels,
+    }
+
     return (
-      // SVG 外框：畫布容器
-      <svg width={this.svgWidth} height={this.svgHeight} style={{ border: "1px solid #ddd" }}>
-        {/* AxesView 自己會 translate(margin.left, margin.top) */}
-        <AxesView 
-          // width={innerW} 
-          // height={innerH} 
-          // xDomain={scene.xDomain}
-          // yDomain={scene.yDomain}
-          viewport = {viewport}
+      <div>
+        {/* 控制區: 下拉 + 勾選 */}
+        <div>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8 }}>
+            <label>
+              Ticks:
+              <select value={this.state.ticks} onChange={this.handleOnTicksChange} style={{ marginLeft: 6 }}>
+                {ALLOWED_TICKS.map((ticksAllowedValue) => (
+                  <option key={`ticks-${ticksAllowedValue}`} value={ticksAllowedValue}>
+                    {ticksAllowedValue}
+                  </option>
+                ))}
+              </select>
+            </label>
 
-          margin={this.svgMargin}           
-          ticks={5}
-        />
+            <label>
+              <input
+                type="checkbox"
+                checked={this.state.showTickLines}
+                onChange={this.handleOnShowTickLinesChange}
+              />
+              顯示刻度線
+            </label>
 
-        {/* 內容區的群組 <g>：把「畫圖原點 (0,0)」從整張 SVG 的左上角，搬到內容區的左上角 */}
-        <g transform={`translate(${this.svgMargin.left},${this.svgMargin.top})`}>
-          {/* SvgSceneView：吃 scene.drawables 畫出 budget/indiff/opt/text
-              同時把拖曳事件回報給 GraphView */}
-          <SvgSceneView
-            scene={scene} // Parent Component => Child Component
-            onPointDrag={this.handlePointDrag}  // Child Component => Parent Component
+            <label>
+              <input
+                type="checkbox"
+                checked={this.state.showTickLabels}
+                onChange={this.handleOnShowTickLabelsChange}
+              />
+              顯示刻度文字
+            </label>
+            
+          </div>
+
+        </div>
+
+        {/* SVG 外框：畫布容器 */}
+        <svg width={this.svgWidth} height={this.svgHeight} style={{ border: "1px solid #ddd" }}>
+          {/* AxesView 自己會 translate(margin.left, margin.top) */}
+          <AxesView 
+            // width={innerW} 
+            // height={innerH} 
+            // xDomain={scene.xDomain}
+            // yDomain={scene.yDomain}
+            viewport = {viewport}
+
+            margin={this.svgMargin}           
+            ticks={this.state.ticks}
+            tickVisibility={tickVisibility}
           />
-        </g>
-      </svg>
+
+          {/* 內容區的群組 <g>：把「畫圖原點 (0,0)」從整張 SVG 的左上角，搬到內容區的左上角 */}
+          <g transform={`translate(${this.svgMargin.left},${this.svgMargin.top})`}>
+            {/* SvgSceneView：吃 scene.drawables 畫出 budget/indiff/opt/text
+                同時把拖曳事件回報給 GraphView */}
+            <SvgSceneView
+              scene={scene} // Parent Component => Child Component
+              onPointDrag={this.handlePointDrag}  // Child Component => Parent Component
+            />
+          </g>
+        </svg>
+      </div>
     );
   }
 }

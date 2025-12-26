@@ -34,15 +34,15 @@ type Props = {
   onPointDrag?: (id: string, pixel: { x: number; y: number }) => void;
 };
 
-// ------------------------------------------------------------
-// 小工具：exhaustiveness check
-// 目的：如果你未來在 Drawable union type 新增一種 kind（例如 "rect"）
-// 但忘記在 renderer 裡處理，TypeScript 會在這裡報錯提醒你補齊。
-// ------------------------------------------------------------
-function assertNever(x: never): never {
-  // 這個 throw 理論上不會被執行（因為 x 是 never 表示不可能發生）
-  throw new Error("Unhandled drawable kind: " + String(x));
-}
+// // ------------------------------------------------------------
+// // 小工具：exhaustiveness check
+// // 目的：如果你未來在 Drawable union type 新增一種 kind（例如 "rect"）
+// // 但忘記在 renderer 裡處理，TypeScript 會在這裡報錯提醒你補齊。
+// // ------------------------------------------------------------
+// function assertNever(x: never): never {
+//   // 這個 throw 理論上不會被執行（因為 x 是 never 表示不可能發生）
+//   throw new Error("Unhandled drawable kind: " + String(x));
+// }
 
 // ------------------------------------------------------------
 // class component 版本（OOP）
@@ -103,6 +103,19 @@ export class SvgSceneView extends React.Component<Props> {
     this.handlePointerCancel = this.handlePointerCancel.bind(this);
   }
 
+
+  
+  // ------------------------------------------------------------
+  // 小工具：exhaustiveness check
+  // 目的：如果你未來在 Drawable union type 新增一種 kind（例如 "rect"）
+  // 但忘記在 renderer 裡處理，TypeScript 會在這裡報錯提醒你補齊。
+  // ------------------------------------------------------------
+  private assertNever(x: never): never {
+    // 這個 throw 理論上不會被執行（因為 x 是 never 表示不可能發生）
+    throw new Error("Unhandled drawable kind: " + String(x));
+  }
+
+
   // ----------------------------------------------------------
   // getLocalPoint：
   // 把滑鼠/手指事件 e.clientX/e.clientY（視窗座標）
@@ -114,7 +127,7 @@ export class SvgSceneView extends React.Component<Props> {
   // ----------------------------------------------------------
   private getLocalPoint(e: React.PointerEvent<SVGGElement>) {
     const g = this.gRef.current;
-    
+
     // 防呆：ref 還沒掛載時 current 可能是 null
     if (!g) {
       return { x: 0, y: 0 };
@@ -650,7 +663,8 @@ export class SvgSceneView extends React.Component<Props> {
             // - 如果你新增了 Drawable kind 卻忘記補 case，TS 會在 assertNever 報錯提醒你
             // -----------------------------
             default: {
-              return assertNever(d);
+              const _exhaustiveCheck: never = d;
+              return this.assertNever(_exhaustiveCheck);
             }
           }
         })}

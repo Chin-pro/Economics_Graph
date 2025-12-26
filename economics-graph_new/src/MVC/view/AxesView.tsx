@@ -19,10 +19,17 @@ import React from "react";
 // 這裡只 import type：只拿型別，不會進 bundle
 import type { Margin } from "../../core/types";
 
-// =========================================================
-//  AxesView 直接使用 Viewport（同一套座標換算規則）
-// =========================================================
+// 匯入 Viewport: AxesView 直接使用 Viewport（同一套座標換算規則）
 import { Viewport } from "../../core/Viewport";
+
+// 匯入 刻度生成工具
+import {
+  buildXTicks,
+  buildYTicks,
+  normalizeTicks,
+  type TickStyle,
+  type TickVisibility,
+} from "./axesTicks"
 
 // ------------------------------------------------------------
 // Props：AxesView 的輸入
@@ -44,15 +51,10 @@ type Props = {
   margin: Margin;
 
   ticks?: number,
+
+  tickVisibility?: TickVisibility;  // 線段/字體獨立控制
 };
 
-// ------------------------------------------------------------
-// formatTick：控制刻度文字顯示格式
-// 想顯示整數、小數幾位，都改這裡就好
-// ------------------------------------------------------------
-function formatTick(value: number) {
-  return value.toFixed(2);
-}
 
 // ------------------------------------------------------------
 // class component（OOP）版本的 View
@@ -70,143 +72,70 @@ export class AxesView extends React.Component<Props> {
     //
     // [修改]: 改從 viewport 取得 size/domain (同一份座標系)
     // --------------------------------------------------------
-    // const width = this.props.width;
-    // const height = this.props.height;
-    // const xMin = this.props.xDomain[0];
-    // const xMax = this.props.xDomain[1];
-    // const yMin = this.props.yDomain[0];
-    // const yMax = this.props.yDomain[1];
+    
     const vp = this.props.viewport;
     const svgInnerWidth = vp.getInnerWidth();      // 內容區寬度
     const svgInnerHeight = vp.getInnerHeight();    // 內容區高度
     const xEconDomain = vp.getXEconDomain();  // 經濟座標 x 的範圍 [xMin, xMax]
     const yEconDomain = vp.getYEconDomain();  // 經濟座標 y 的範圍 [yMin, yMax]
     
-    const xEconMin = xEconDomain[0];
-    const xEconMax = xEconDomain[1];
-    const yEconMin = yEconDomain[0];
-    const yEconMax = yEconDomain[1];
 
     const margin = this.props.margin;
     
-    // ticks 預設值: 如果沒傳入，就使用 5
-    let ticks = this.props.ticks;
-    if (ticks === undefined) {
-      ticks = 5;
+
+    // normalizeTicks(): ticks 的預設與防呆機制
+    const ticks = normalizeTicks(this.props.ticks);
+
+    // 刻度視覺參數 (集中成 TickStyle)
+    const style: TickStyle = {
+      tickLen: 6,
+      fontSize: 11
     }
 
-    // 防呆: ticks 至少要 1
-    if (ticks < 1) {
-      ticks = 1;
+    // 預設: 線段與字體皆顯示
+    let visibility = this.props.tickVisibility;
+    if ( visibility === undefined ) {
+      visibility = { showTickLines: true, showTickLabels: true}
     }
-
-    // range (domain 長度)
-    const xEconRange = xEconMax - xEconMin;
-    const yEconRange = yEconMax - yEconMin;
-
-    // 刻度的視覺參數
-    const tickLen = 6;
-    const fontSize = 11;
-
-    // 軸線位置改為「經濟座標 0」在 viewport 中的像素位置
-    //  - X 軸是一條水平線，所以它最重要的是「它的 y 值是多少」
-    //  - Y 軸是一條垂直線，所以它最重要的是「它的 x 值是多少」
-    const xAxisY = vp.yEconToYPixel(0);  // 經濟座標 y=0 的 y 像素座標
-    const yAxisX = vp.xEconToXPixel(0);  // 經濟座標 x=0 的 x 像素座標
 
     // --------------------------------------------------------
-    // 計算刻度（X 軸與 Y 軸）
+    // xAxisY / yAxisX ：
     //
-    // 核心概念：
-    // 1) 刻度位置（像素）：
-    //    - x 軸：從 0 到 width
-    //      xPix = (i / ticks) * width
+    // 1) X 軸是「水平線」——水平線的位置由「y」決定
+    //   (X 軸是一條水平線，所以它最重要的是「它的 y 值是多少」)
+    //    所以 xAxisY 的意思是：
+    //    「X 軸那條水平線，在畫面上的 yPixel 在哪裡？」
     //
-    //    - y 軸：從 0 到 height（但 SVG 的 y 是往下增加）
-    //      我們希望「y=0 在下方」更像數學座標，所以用：
-    //      yPix = height - (i / ticks) * height
+    // 2) Y 軸是「垂直線」——垂直線的位置由「x」決定
+    //   (Y 軸是一條垂直線，所以它最重要的是「它的 x 值是多少」)
+    //    所以 yAxisX 的意思是：
+    //    「Y 軸那條垂直線，在畫面上的 xPixel 在哪裡？」
     //
-    // 2) 刻度文字（domain 的值）：
-    //    - xVal = xMin + (i / ticks) * (xMax - xMin)
-    //    - yVal = yMin + (i / ticks) * (yMax - yMin)
-    //
-    // 這樣就能做到「五等分顯示值」
-    const xTickNodes: React.ReactNode[] = [];  // xTickNodes 就是一個「裝 React 元素」的陣列
-    const yTickNodes: React.ReactNode[] = [];  // yTickNodes 就是一個「裝 React 元素」的陣列
+    // 我們用 Viewport 把「經濟座標的 0」換成像素：
+    // - yEcon=0 => yPixel (就是 x 軸的位置)
+    // - xEcon=0 => xPixel (就是 y 軸的位置)
+    // --------------------------------------------------------
+    const xAxisYPixel = vp.yEconToYPixel(0);  // 經濟座標 y=0 的 y 像素座標
+    const yAxisXPixel = vp.xEconToXPixel(0);  // 經濟座標 x=0 的 x 像素座標
 
-    let i = 0;
-    while (i <= ticks) {
-      const t = i/ticks;  // t 介於 0-1
-      
-      // -------------------------
-      // X axis ticks
-      //
-      // [修改]: X ticks: 先計算經濟座標值(或加 padding/zoom)，再用 vp.x(...) 計算像素位置
-      // -------------------------
-      // const xPix = t*width;
-      // const xVal = xMin + t*xRange;
-      const xEconVal = xEconMin + t * xEconRange;  // 這個刻度在「經濟座標」的數值
-      const xPixel = vp.xEconToXPixel(xEconVal);    // 把經濟座標換成「像素 xPixel」
 
-      xTickNodes.push(
-        <g key={`xtick-${i}`}>
-          {/* 刻度線: 從 (xPix, height) 往下畫 tickLen */}
-          <line
-            x1 = {xPixel}
-            y1 = {xAxisY}
-            x2 = {xPixel}
-            y2 = {xAxisY + tickLen}
-            stroke = "currentColor"
-          />
-          {/* 刻度文字：置中對齊 */}
-          <text
-            x = {xPixel}
-            y = {xAxisY + tickLen + fontSize}
-            fontSize = {fontSize}
-            textAnchor = "middle"
-            fill = "currentColor"
-          >
-            {formatTick(xEconVal)}
-          </text>
-        </g>
-      );
+    const xTickNodes = buildXTicks({
+      vp,
+      ticks,
+      xAxisYPixel,
+      xEconDomain,
+      style,
+      visibility,
+    });
 
-      // -------------------------
-      // Y axis ticks
-      //
-      // [修改]: Y ticks: 先計算經濟座標值(或加 padding/zoom)，再用 vp.y(...) 計算像素位置
-      // -------------------------
-      // yPix 從底往上
-      // const yPix = (1-t) * height;
-      // const yVal = yMin + t * yRange;
-      const yEconVal = yEconMin + t * yEconRange;  // 經濟座標 yEcon 的刻度值
-      const yPixel = vp.yEconToYPixel(yEconVal);   // 換成像素 yPixel（注意會反轉）
-
-      yTickNodes.push(
-        <g key={`ytick-${i}`}>
-          {/* 刻度線：從 (0, yPix) 往左畫 tickLen */}
-          <line
-            x1 = {yAxisX}
-            y1 = {yPixel}
-            x2 = {yAxisX - tickLen}
-            y2 = {yPixel}
-            stroke = "currentColor"
-          />
-          {/* 刻度文字：右對齊貼近 y 軸 */}
-          <text
-            x = {yAxisX - tickLen - 2}
-            y = {yPixel + fontSize / 3}
-            fontSize = {fontSize}
-            textAnchor = "end"
-            fill = "currentColor"
-          >
-            {formatTick(yEconVal)}
-          </text>
-        </g>
-      );
-
-      i++;
-    }
+    const yTickNodes = buildYTicks({
+      vp,
+      ticks,
+      yAxisXPixel,
+      yEconDomain,
+      style,
+      visibility,
+    });
 
 
     // --------------------------------------------------------
@@ -228,9 +157,9 @@ export class AxesView extends React.Component<Props> {
             ----------------------------------------------- */}
         <line
           x1={0}
-          y1={xAxisY}
+          y1={xAxisYPixel}
           x2={svgInnerWidth}
-          y2={xAxisY}
+          y2={xAxisYPixel}
           stroke="currentColor"
         />
 
@@ -240,14 +169,14 @@ export class AxesView extends React.Component<Props> {
             - 放在內容區最左邊（x=0）
             ----------------------------------------------- */}
         <line 
-          x1={yAxisX} 
+          x1={yAxisXPixel} 
           y1={0} 
-          x2={yAxisX} 
+          x2={yAxisXPixel} 
           y2={svgInnerHeight} 
           stroke="currentColor" 
         />
 
-        {/* 畫出刻度（X 軸、Y 軸） */}
+        {/* 由 visibility 決定是否出現線/字體，畫出刻度（X 軸、Y 軸） */}
         {xTickNodes}
         {yTickNodes}
       </g>
