@@ -53,6 +53,10 @@ type Props = {
   ticks?: number,
 
   tickVisibility?: TickVisibility;  // 線段/字體獨立控制
+
+  // plot 區 可用 inner 區塊內的偏移(用於置中)
+  // 這個 offset 是「已扣掉 margin 的內容區」內的位移量(往右、往下)
+  offset?: { x: number; y: number };
 };
 
 
@@ -97,6 +101,13 @@ export class AxesView extends React.Component<Props> {
     if ( visibility === undefined ) {
       visibility = { showTickLines: true, showTickLabels: true}
     }
+
+    // offset 預設 0
+    let offset = this.props.offset;
+    if (offset === undefined) {
+      offset = { x: 0, y: 0 };
+    }
+
 
     // --------------------------------------------------------
     // xAxisY / yAxisX ：
@@ -146,9 +157,12 @@ export class AxesView extends React.Component<Props> {
     // 假設你的外框 SVG 先畫了 margin，內容區才是 innerW/innerH，
     // 那你把 <g> 往右下移動 margin.left/margin.top，
     // 就能讓 (0,0) 對齊內容區左上角。
+    //
+    // margin：把座標軸放到內容區左上
+    // offset：把 plot 區在內容區內置中，確保 軸 和 圖 在同一個 plot 區座標系下
     // --------------------------------------------------------
     return (
-      <g transform={`translate(${margin.left},${margin.top})`}>
+      <g transform={`translate(${margin.left + offset.x},${margin.top + offset.y})`}>
         {/* -----------------------------------------------
             x-axis：水平線
             - 從 (0, height) 畫到 (width, height)

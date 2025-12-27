@@ -271,6 +271,72 @@ export class ConsumerOptController {
     }
   }
 
+  
+  // ---------------------------------------------------------
+  // computePlotInnerSize(): 依 px/py 決定「plot 區域」像素寬高比例
+  // - arg:
+  //   1. width: 這次要畫圖的區域-像素寬度
+  //   2. height: 這次要畫圖的區域-像素高度
+  // 
+  //   - px 變大 → x 軸變短（相對於 y）
+  //   - py 變大 → y 軸變短（等價：x 相對變長）
+  //
+  // Let
+  //   plotWidth / plotHeight = py / px
+  //
+  // 同時：plotW/plotH 不能超出可用的 innerW/innerH
+  // 所以要在 availW×availH 裡，找「最大可放的矩形」
+  // ---------------------------------------------------------
+  private computePlotInnerSize(px: number, py:number): {
+    width: number;
+    height: number
+  } {
+    const availWidth = this.innerW;   // 可畫圖的區域 (像素寬度)
+    const availHeight = this.innerH;  // 可畫圖的區域 (像素高度)
+
+    // priceRatio = plotWidth / plotHeight
+    let priceRatio = 1;  // 預設 1，plot 區域的長寬比 = px 和 py 的比
+    // 防呆: px、py 需要大於 0
+    if (px > 0 && py > 0) {
+      priceRatio = py/px
+    }
+
+    // 避免極端比例讓圖接近消失 (可自行調整上下界)
+    //  - 如果出現: px/py 極端，priceRatio 可能非常大禍非常小，導致圖形變成一條線
+    if (priceRatio < 0.1) {
+      priceRatio = 0.1;
+    }
+    if (priceRatio > 10) {
+      priceRatio = 10;
+    }
+
+    const availRatio = availWidth / availHeight;
+
+    // 預設把 plot 塞滿整個可用區
+    let width = availWidth;
+    let height = availHeight;
+
+    if (availRatio > priceRatio) {
+      height = availHeight;
+      width = availHeight * priceRatio;
+    } else {
+      width = availWidth;
+      height = availWidth / priceRatio;
+    }
+
+    if (width < 1) {
+      width = 1;
+    }
+    if (height < 1) {
+      height = 1;
+    }
+
+    return {width, height};
+  }
+
+
+
+
   // buildScene：把 model 的參數轉成 SceneOutput
   //
   // 這步「等價於你舊架構的 ConsumerOptScene.build()」
@@ -283,9 +349,15 @@ export class ConsumerOptController {
     const xEconMax = (p.I / p.px) * 1.2;
     const yEconMax = (p.I / p.py) * 1.2;
 
+
+    // 依 px/py 決定 plot 的像素大小 (軸長會跟著變)
+    const plotSize = this.computePlotInnerSize(p.px, p.py);
+
+
     // 建立 viewport：經濟座標 -> 像素座標
-    const vp = new Viewport(this.innerW, this.innerH, [0, xEconMax], [0, yEconMax]);
+    const vp = new Viewport(plotSize.width, plotSize.height, [0, xEconMax], [0, yEconMax]);
     this.lastViewport = vp;  // 同步更新 lastViewport
+
 
     // 由 model 計算經濟元素
     const budget = this.model.computeBudget();     // 預算線端點（經濟座標）
@@ -355,8 +427,8 @@ export class ConsumerOptController {
 
     // 回傳 SceneOutput
     return {
-      width: this.innerW,
-      height: this.innerH,
+      width: plotSize.width,
+      height: plotSize.height,
       drawables,
       xDomain: [0, xEconMax],
       yDomain: [0, yEconMax],

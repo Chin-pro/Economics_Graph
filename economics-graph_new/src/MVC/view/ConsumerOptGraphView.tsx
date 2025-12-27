@@ -85,14 +85,8 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
 
   private subscribedController: ConsumerOptController | null;
 
-
-  // // handlers for Tick
-  // private handleOnTicksChange: (e: React.ChangeEvent<HTMLSelectElement>) => void;
-  // private handleOnShowTickLinesChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
-  // private handleOnShowTickLabelsChange: (e: React.ChangeEvent<HTMLElement>) => void;
-
-
-
+  // 拿到 <svg> DOM 匯出使用
+  private svgRef: React.RefObject<SVGSVGElement | null>;
 
   // ----------------------------------------------------------
   // constructor：初始化 view 的常數、state、事件綁定、訂閱 controller
@@ -144,6 +138,12 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     this.handleOnTicksChange = this.handleOnTicksChange.bind(this);
     this.handleOnShowTickLinesChange = this.handleOnShowTickLinesChange.bind(this);
     this.handleOnShowTickLabelsChange = this.handleOnShowTickLabelsChange.bind(this);
+
+    // 匯出 SVG handler
+    this.handleExportSvg = this.handleExportSvg.bind(this);
+
+    // svg ref: 拿到真正的 <svg> DOM 節點
+    this.svgRef = React.createRef<SVGSVGElement>();
 
     // --------------------------------------------------------
     // 訂閱 controller：這就是你前面問的「訂閱者」！
@@ -270,6 +270,56 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
   }
 
 
+  // =========================================================
+  // 匯出 SVG（LaTeX 可用）
+  //
+  // 做法：
+  // 1) clone 一份 svg DOM（不要直接改畫面那份）
+  // 2) 加 xmlns / viewBox（讓外部工具更穩）
+  // 3) 用 XMLSerializer -> Blob -> <a download> 下載
+  // =========================================================
+  private handleExportSvg() {
+    // 先取得畫面上的 <svg>
+    const svg = this.svgRef.current;
+    if (!svg) {
+      return
+    }
+
+
+    const svgCloned = svg.cloneNode(true) as SVGSVGElement;  // 避免直接影響原 <svg> 元素
+    
+    // 加上 xmlns (SVG 標準)
+    //  - 有些工具看到 XML (SVG 本質上是一種 XML)，如果沒有 xmlns，可能解析會失敗
+    svgCloned.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+
+    // 加上 viewBox: 讓 LaText / Inkscape 縮放更穩，避免切掉、跑位
+    svgCloned.setAttribute("viewBox",  `0 0 ${this.svgWidth} ${this.svgHeight}`);
+
+    // 匯出時拿掉 border (避免文件有醜框)
+    // 並且明確指定 color (因為許多 stroke 使用 currentColor)
+    svgCloned.setAttribute("style", "color: black;");
+
+    const serializer = new XMLSerializer();
+    const source = serializer.serializeToString(svgCloned);
+    const withHeader = `<?xml version="1.0" encoding="UTF-8"?>\n${source}`;
+
+    const blob = new Blob([withHeader], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "consumer-opt.svg";
+    document.body.appendChild(a);
+    a.click();
+
+    // 清理 DOM 與 釋放暫時 URL (避免記憶體累積)
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+  }
+
+
+
   // ----------------------------------------------------------
   // render：把目前 state.scene 畫出來
   // ----------------------------------------------------------
@@ -289,6 +339,39 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
       showTickLabels: this.state.showTickLabels,
     }
 
+        
+    // --------------------------------------------------------
+    // 置中 offset 計算（關鍵）
+    //
+    // 可用內容區 = svgWidth/Height 扣掉 margin
+    // plot 區大小 = viewport.getInnerWidth/Height（由 controller 算出，會隨 px/py 改）
+    // offset = (avail - plot) / 2
+    //
+    // 這個 offset 必須同時用在：
+    // - AxesView translate
+    // - SvgSceneView 的 <g> translate
+    // 否則軸與圖形會錯位
+    // --------------------------------------------------------
+    // 扣掉 margin 後，真正能畫 plot 的空間
+    const innerWAvail = this.svgWidth - this.svgMargin.left - this.svgMargin.right;
+    const innerHAvail = this.svgHeight - this.svgMargin.top - this.svgMargin.bottom;
+
+    // plot 的實際尺寸由 controller 決定 (會隨 px/py 改變)
+    const plotW = viewport.getInnerWidth();
+    const plotH = viewport.getInnerHeight();
+
+    let offsetX = (innerWAvail - plotW) / 2;
+    let offsetY = (innerHAvail - plotH) / 2;
+
+    // 防呆機制: 不允許 offset < 0 (理論上不會，因為 controller 已經控制 plot <= avail)
+    if (offsetX < 0) {
+      offsetX = 0;
+    }
+    if (offsetY < 0) {
+      offsetY = 0;
+    }
+
+
     return (
       <div>
         {/* 控制區: 下拉 + 勾選 */}
@@ -296,7 +379,11 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
           <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8 }}>
             <label>
               Ticks:
-              <select value={this.state.ticks} onChange={this.handleOnTicksChange} style={{ marginLeft: 6 }}>
+              <select 
+                value={this.state.ticks} 
+                onChange={this.handleOnTicksChange} 
+                style={{ marginLeft: 6 }}
+              >
                 {ALLOWED_TICKS.map((ticksAllowedValue) => (
                   <option key={`ticks-${ticksAllowedValue}`} value={ticksAllowedValue}>
                     {ticksAllowedValue}
@@ -323,27 +410,37 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
               顯示刻度文字
             </label>
             
+            {/* 匯出按鈕 */}
+            <button 
+              onClick = {this.handleExportSvg}
+              style={{ marginLeft: 12 }}
+            >
+              Export SVG
+            </button>
+
+
           </div>
 
         </div>
 
         {/* SVG 外框：畫布容器 */}
-        <svg width={this.svgWidth} height={this.svgHeight} style={{ border: "1px solid #ddd" }}>
+        <svg 
+          ref={this.svgRef}
+          width={this.svgWidth} 
+          height={this.svgHeight} 
+          style={{ border: "1px solid #ddd" }}
+        >
           {/* AxesView 自己會 translate(margin.left, margin.top) */}
           <AxesView 
-            // width={innerW} 
-            // height={innerH} 
-            // xDomain={scene.xDomain}
-            // yDomain={scene.yDomain}
             viewport = {viewport}
-
-            margin={this.svgMargin}           
+            margin={this.svgMargin}
+            offset={{ x: offsetX, y: offsetY }}
             ticks={this.state.ticks}
             tickVisibility={tickVisibility}
           />
 
           {/* 內容區的群組 <g>：把「畫圖原點 (0,0)」從整張 SVG 的左上角，搬到內容區的左上角 */}
-          <g transform={`translate(${this.svgMargin.left},${this.svgMargin.top})`}>
+          <g transform={`translate(${this.svgMargin.left + offsetX},${this.svgMargin.top + offsetY})`}>
             {/* SvgSceneView：吃 scene.drawables 畫出 budget/indiff/opt/text
                 同時把拖曳事件回報給 GraphView */}
             <SvgSceneView
