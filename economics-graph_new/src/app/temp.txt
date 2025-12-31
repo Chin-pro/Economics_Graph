@@ -1,0 +1,3856 @@
+以下為目前代碼結構:
+1. AppView.tsx: "// src/app/AppView.tsx
+
+// ------------------------------------------------------------
+// AppView：你的「應用程式最上層 View」(React class component)
+// 角色：
+// 1) 建立 Model（狀態/經濟計算）
+// 2) 建立 Controller（協調 Model、產生 Scene、通知 View）
+// 3) 建立 GraphView（SVG 畫布呈現）
+// 4) 管理 slider 的 UI state（I, a）
+// 5) 讓拖曳點更新 a 時，slider 也能同步更新（雙向同步）
+//
+// 在 MVC 的語言裡：
+// - AppView 是「Composition Root」：負責把 MVC 物件組起來
+// - 它本身仍是 View，但也是 "wiring" 的地方
+//
+// 重要更新（React 18 / StrictMode 常見坑）
+// - subscribe 這種「副作用」不要放在 constructor
+// - 要放在 componentDidMount（確保元件真的 mounted 後才訂閱）
+// - 卸載時在 componentWillUnmount 取消訂閱
+// ------------------------------------------------------------
+
+import React from "react";
+
+// Model：保存參數 + 提供 econ compute
+import { ConsumerOptModel, type ConsumerParams } from "../MVC/model/ConsumerOptModel";
+
+// Controller：接 UI 事件、更新 model、build scene、notify listeners
+import { ConsumerOptController } from "../MVC/controller/ConsumerOptController";
+
+// GraphView：SVG 容器 + 訂閱 controller 更新 + renderer (SvgSceneView)
+import { ConsumerOptGraphView } from "../MVC/view/ConsumerOptGraphView";
+
+// ControlledSlider : 匯入拖曳條組件
+import { ControlledSlider } from "../common/ControlledSlider";
+
+import type { TickVisibility } from "../MVC/view/axesTicks";
+import { computeInnerAvailSize } from "../core/layout";
+
+
+// ------------------------------------------------------------
+// ALLOWED_TICKS: 限制 ticks 值: 避免奇怪數字 (1, 2, 4, 5, 10)
+// ------------------------------------------------------------
+const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10]; 
+
+// ------------------------------------------------------------
+// AppView 的 state：
+// - I：收入 slider 顯示用（UI state）
+// - a：alpha slider 顯示用（UI state）
+//
+// 注意：Model 內也有一份 I/a（Model state）
+// - slider 改變：AppView setState + controller 更新 model
+// - 拖曳點改變：controller 更新 model，並 notify，AppView 再 setState 同步 slider
+// ------------------------------------------------------------
+type State = {
+  // 模型相關 (UI 顯示用)
+  I: number;
+  a: number;
+  px: number;
+  py: number;
+
+  // 圖表控制 (純 UI)
+  ticks: number;
+  showTickLines: boolean;
+  showTickLabels: boolean;
+
+  // 軸標籤 (變數名稱)
+  xLabel: string;
+  yLabel: string;
+
+  // 圖表標題 (會出現在 SVG 內)
+  chartTitle: string;
+
+  // 匯出檔名
+  exportFileName: string;
+
+  // 線段顏色 (線段 + 方程式標籤共用)
+  budgetColor: string;
+  indiffColor: string;
+};
+
+// ------------------------------------------------------------
+// React.Component<Props, State> 
+//   => P : props 的型別；S : state 的型別
+// 你的 props 不需要任何東西，所以用 Record<string, never>
+// （代表：不允許有任何 props key）
+// ------------------------------------------------------------
+export default class AppView extends React.Component<
+  Record<string, never>,  // props 型別
+  State                   // state 型別
+> {
+  // ----------------------------------------------------------
+  // controller / model：用 class fields 保存（不放在 state）
+  //
+  // - 這些是「長壽命物件」，不需要因為它們改變就 re-render
+  // - state 只放 UI 需要觸發 render 的資料（I,a）
+  // ----------------------------------------------------------
+  private controller: ConsumerOptController;
+  private model: ConsumerOptModel;
+
+
+  // 用 ref 拿到 GraphView，才能從左側按鈕呼叫 exportSvg
+  private graphRef: React.RefObject<ConsumerOptGraphView | null>;
+
+  // ----------------------------------------------------------
+  // constructor：初始化 UI state、建立 MVC 物件、綁定事件、建立同步訂閱
+  // ----------------------------------------------------------
+  constructor(props: Record<string, never>) {  // 組件傳入參數 props
+    super(props);
+
+    // 1) 初始化參數
+    const initialParameters: ConsumerParams = { I: 20, a: 0.5, px: 1, py: 1}
+
+    // 2) 初始化 UI state（slider 顯示用）
+    this.state = { 
+      I: initialParameters.I, 
+      a: initialParameters.a,
+      px: initialParameters.px,
+      py: initialParameters.py,
+
+      ticks: 5,
+      showTickLines: true,
+      showTickLabels: true,
+
+      xLabel: "x",
+      yLabel: "y",
+
+      chartTitle: "Consumer Optimum (Cobb-Douglas)",
+      exportFileName: "figure-consumer-opt.svg",
+
+      budgetColor: "#111111",
+      indiffColor: "#111111",
+    };
+
+    // 3) 建立 Model：把初始參數塞進去
+    //    注意：Model 內部自己保存一份 params
+    //    等價於:
+    //      " this.model = new ConsumerOptModel({ 
+    //          I: initialParameters.I, 
+    //          a: initialParameters.a, 
+    //          px: initialParameters.px, 
+    //          py: initialParameters.py
+    //        })"
+    this.model = new ConsumerOptModel(initialParameters);
+
+
+    // 4) 建立 Controller (協調 model、產 scene、通知 view)
+    //    Controller 需要 innerW/innerH（內容區大小），以及 model
+    //
+    //    你這裡寫：
+    //      innerW: 520 - 40 - 20
+    //      innerH: 360 - 20 - 30
+    //    其實就是：
+    //      W=520, H=360
+    //      margin = {left:40, right:20, top:20, bottom:30}
+    //
+    //    ⚠️ 風險：GraphView 裡如果 margin 或 W/H 改了，
+    //      但 AppView 沒改，controller 的 innerW/innerH 就會跟 View 不一致，
+    //      拖曳的 pixel<->econ 會比例錯。
+    //
+    //    更乾淨做法：由 GraphView/或一個共用 LayoutConfig 統一產生 innerW/innerH。
+    // TODO: 建議抽到共用 LayoutConfig，避免 GraphView 改 margin/W/H 時不一致
+    // 改由 layout 統計計算 innerWidth/innerHeight，避免 hard code
+    const inner = computeInnerAvailSize();
+
+    this.controller = new ConsumerOptController({
+      innerWidth: inner.innerWidth,
+      innerHeight: inner.innerHeight,
+      model: this.model,
+    });
+
+    this.graphRef = React.createRef<ConsumerOptGraphView>();
+
+
+    // 5) bind：class component 綁定 this
+    //    因為下面會把 handler 當 callback 傳給 onChange / subscribe
+    //    當 callback 傳遞時才不會 this=undefined
+    this.handleParamsFromController = this.handleParamsFromController.bind(this);
+    this.handleIncomeChange = this.handleIncomeChange.bind(this);
+    this.handleAlphaChange = this.handleAlphaChange.bind(this);
+    
+    this.handlePxChange = this.handlePxChange.bind(this);
+    this.handlePyChange = this.handlePyChange.bind(this);
+
+    this.handleModelSyncFromController = this.handleModelSyncFromController.bind(this);
+
+    this.handleExportClick = this.handleExportClick.bind(this);
+
+    // ??? 你也可以保留 handleIncomeChange/handleAlphaChange，但這裡直接用 slider onChange inline 即可
+
+  }
+
+  // ----------------------------------------------------------
+  // componentDidMount：(mounted 後才訂閱)
+  // 安全：確保組件真的出現在畫面上，避免組件尚未掛載即渲染
+  // this.setState({ I:p.I, a:p.a })：確保訂閱開始後，UI state 立刻跟
+  // model state 對齊，避免極端時序下不同步
+  // ----------------------------------------------------------
+  componentDidMount(){
+    this.controller.subscribe(this.handleParamsFromController);
+
+    // 確保 mounted 後 UI state 跟 model params 完全一致
+    const params = this.model.getModelParams();
+    this.setState({ I: params.I, a: params.a, px: params.px, py: params.py });
+  }
+
+
+  // ----------------------------------------------------------
+  // componentWillUnmount：元件卸載時解除訂閱 (卸載前取消訂閱)
+  // 避免 controller 還在 notify 時呼叫 setState，造成 memory leak 警告
+  // ----------------------------------------------------------
+  componentWillUnmount() {
+    this.controller.unsubscribe(this.handleParamsFromController);
+  }
+
+  // ----------------------------------------------------------
+  // handleModelSyncFromController：
+  // controller notify 時，同步 model -> UI (slider)
+  // ----------------------------------------------------------
+  private handleModelSyncFromController() {
+    const params = this.model.getModelParams();
+    this.setState({ I: params.I, a: params.a, px: params.px, py: params.py });
+  }
+
+  // ----------------------------------------------------------
+  // handleExportClick：
+  //
+  // ----------------------------------------------------------
+  private handleExportClick() {
+    const graphRefClick = this.graphRef.current;
+    if (!graphRefClick) {
+      return;
+    }
+    graphRefClick.exportSvg(this.state.exportFileName);
+  }
+
+
+  // // ----------------------------------------------------------
+  // // handleAlphaFromController：
+  // // 當 controller 通知「scene 更新」時，AppView 讀取 model params，
+  // // 把最新的 a / I 同步回 UI state。
+  // //
+  // // 這個設計的本質：你把「單一真實來源」放在 Model，
+  // // AppView 只是把 Model 的值映射到 UI（slider）。
+  // //
+  // // ⚠️ 注意：你這裡同步 I 其實也合理，
+  // // 因為 controller 也可能更新 I（例如未來你允許拖曳預算線端點）
+  // // ----------------------------------------------------------
+  // private handleAlphaFromController() {
+  //   const p = this.model.getModelParams();
+  //   this.setState({ a: p.a, I: p.I });
+  // }
+
+
+  // ----------------------------------------------------------
+  // handleParamsFromController：
+  // 當 controller 通知「scene 更新」時，AppView 讀取 model params，
+  // 把最新的 I/a/px/py 同步回 UI state。
+  //
+  // 這個設計的本質：你把「單一真實來源」放在 Model，
+  // AppView 只是把 Model 的值映射到 UI（slider）。
+  // ----------------------------------------------------------
+  private handleParamsFromController() {
+    const params = this.model.getModelParams();
+    this.setState({ I: params.I, a: params.a, px: params.px, py: params.py });
+  }
+
+  // ----------------------------------------------------------
+  // handleIncomeChange：收入 slider 改變
+  //
+  // 做兩件事：
+  // 1) 更新 AppView 的 UI state（讓 slider 顯示正確）
+  // 2) 通知 controller：更新 model + rebuild scene + notify view
+  // 
+  // e: React.ChangeEvent<HTMLInputElement>: 代表 e.target 是一個 HTMLInputElement
+  // ----------------------------------------------------------
+  private handleIncomeChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const nextI = Number(e.currentTarget.value);
+
+    // 更新 UI state（這會觸發 AppView render，使 UI 文字/slider 改變）
+    this.setState({ I: nextI });
+
+    // 通知 controller：這才是真正讓圖重算的來源
+    this.controller.onIncomeChange(nextI);
+  }
+
+  // ----------------------------------------------------------
+  // handleAlphaChange：alpha slider 改變
+  // 同樣做 UI state + controller 更新
+  // ----------------------------------------------------------
+  private handleAlphaChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const nextA = Number(e.currentTarget.value);
+
+    this.setState({ a: nextA });
+    this.controller.onAlphaChange(nextA);
+  }
+
+  // ----------------------------------------------------------
+  // handlePxChange (px slider) & handlePyChange (py slider)：
+  //  - 先更新 UI state (受控的組件的方式)
+  //  - 再叫 controller 更新 model + 重算 scene + notify
+  // ----------------------------------------------------------
+  private handlePxChange(nextPx: number) {
+    this.setState({ px: nextPx });
+    this.controller.onPxChange(nextPx);
+  }
+
+  private handlePyChange(nextPy: number) {
+    this.setState({ py: nextPy });
+    this.controller.onPyChange(nextPy);
+  }
+
+
+  // ----------------------------------------------------------
+  // render：渲染 UI
+  // - 左側：slider 控制
+  // - 右側：ConsumerOptGraphView（圖）
+  //
+  // 你目前 px/py 固定成 1，只顯示出來，不提供 slider
+  // ----------------------------------------------------------
+  render() {
+    const tickVisibility: TickVisibility = {
+      showTickLines: this.state.showTickLines,
+      showTickLabels: this.state.showTickLabels,
+    }
+
+    return (
+      <div style={{ padding: 16 }}>
+        <div style={{ display: "flex", gap: 24, alignItems: "flex-start" }}>
+          {/* -----------------------------
+              左側：所有控制項統一放這裡
+             ----------------------------- */}
+          <div style={{ width: 320, display: "flex", flexDirection: "column", gap: 14 }}>
+            <h3 style={{ margin: 0 }}>Controls</h3>
+
+            {/* 圖表標題（會顯示在 SVG 內） */}
+            <div>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Chart title</div>
+              <input
+                value={this.state.chartTitle}
+                onChange={(e) => this.setState({ chartTitle: e.currentTarget.value })}
+                style={{ width: "100%" }}
+              />
+            </div>
+
+            {/* 匯出檔名 */}
+            <div>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Export file name</div>
+              <input
+                value={this.state.exportFileName}
+                onChange={(e) => this.setState({ exportFileName: e.currentTarget.value })}
+                style={{ width: "100%" }}
+              />
+              <button onClick={this.handleExportClick} style={{ marginTop: 8 }}>
+                Export SVG
+              </button>
+            </div>
+
+            {/* 軸變數名稱 */}
+            <div style={{ display: "flex", gap: 10 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>X-axis label</div>
+                <input
+                  value={this.state.xLabel}
+                  onChange={(e) => this.setState({ xLabel: e.currentTarget.value })}
+                  style={{ width: "100%" }}
+                />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Y-axis label</div>
+                <input
+                  value={this.state.yLabel}
+                  onChange={(e) => this.setState({ yLabel: e.currentTarget.value })}
+                  style={{ width: "100%" }}
+                />
+              </div>
+            </div>
+
+            {/* ticks */}
+            <div>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Ticks</div>
+              <select
+                value={this.state.ticks}
+                onChange={(e) => {
+                  const raw = Number(e.currentTarget.value);
+
+                  // 防呆：只接受 ALLOWED_TICKS
+                  let ok = false;
+                  let i = 0;
+                  while (i < ALLOWED_TICKS.length) {
+                    if (ALLOWED_TICKS[i] === raw) {
+                      ok = true;
+                    }
+                    i += 1;
+                  }
+                  if (ok) {
+                    this.setState({ ticks: raw });
+                  }
+                }}
+                style={{ width: "100%" }}
+              >
+                {ALLOWED_TICKS.map((v) => (
+                  <option key={`ticks-${v}`} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+
+              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={this.state.showTickLines}
+                    onChange={(e) => this.setState({ showTickLines: e.currentTarget.checked })}
+                  />
+                  顯示刻度線
+                </label>
+
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={this.state.showTickLabels}
+                    onChange={(e) => this.setState({ showTickLabels: e.currentTarget.checked })}
+                  />
+                  顯示刻度文字
+                </label>
+              </div>
+            </div>
+
+            {/* 線段顏色（線與方程式標籤會一起變色） */}
+            <div style={{ display: "flex", gap: 12 }}>
+              <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                Budget color
+                <input
+                  type="color"
+                  value={this.state.budgetColor}
+                  onChange={(e) => {
+                    const c = e.currentTarget.value;
+                    this.setState({ budgetColor: c });
+                    this.controller.setBudgetColor(c);
+                  }}
+                />
+              </label>
+
+              <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                Indiff color
+                <input
+                  type="color"
+                  value={this.state.indiffColor}
+                  onChange={(e) => {
+                    const c = e.currentTarget.value;
+                    this.setState({ indiffColor: c });
+                    this.controller.setIndiffColor(c);
+                  }}
+                />
+              </label>
+            </div>
+
+            {/* 模型參數 sliders */}
+            <ControlledSlider
+              label="Income I"
+              min={5}
+              max={60}
+              value={this.state.I}
+              onChange={(nextI) => {
+                this.setState({ I: nextI });
+                this.controller.onIncomeChange(nextI);
+              }}
+            />
+
+            <ControlledSlider
+              label="a (x exponent)"
+              min={0.1}
+              max={0.9}
+              step={0.01}
+              value={Number(this.state.a.toFixed(2))}
+              onChange={(nextA) => {
+                this.setState({ a: nextA });
+                this.controller.onAlphaChange(nextA);
+              }}
+            />
+
+            <ControlledSlider
+              label="Price px"
+              value={this.state.px}
+              min={0.1}
+              max={5}
+              step={0.1}
+              onChange={(nextPx) => {
+                this.setState({ px: nextPx });
+                this.controller.onPxChange(nextPx);
+              }}
+            />
+
+            <ControlledSlider
+              label="Price py"
+              value={this.state.py}
+              min={0.1}
+              max={5}
+              step={0.1}
+              onChange={(nextPy) => {
+                this.setState({ py: nextPy });
+                this.controller.onPyChange(nextPy);
+              }}
+            />
+          </div>
+
+          {/* -----------------------------
+              右側：GraphView 只負責畫圖
+             ----------------------------- */}
+          <div>
+            <ConsumerOptGraphView
+              ref={this.graphRef}
+              controller={this.controller}
+              ticks={this.state.ticks}
+              tickVisibility={tickVisibility}
+              xLabel={this.state.xLabel}
+              yLabel={this.state.yLabel}
+              chartTitle={this.state.chartTitle}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+"
+2. ControlledSlider.tsx: "// src/common/ControlledSlider.tsx
+// 這個檔案定義一個「可重複使用的 Slider 元件」
+// - 外觀：我們用 div 自己畫（track / fill / thumb / tooltip）
+// - 互動：仍用原生 <input type="range"> 處理（但設成透明）
+// - 受控：value 完全由外部傳入；變更用 onChange 回報給外部
+
+import React from "react";
+// 這裡 import React 的目的：
+// 1) 讓 TS 能識別 JSX 語法（某些設定仍需要）
+// 2) 使用 React 的型別（例如 React.ChangeEvent）
+
+// ------------------------------------------------------------
+// Props 型別：定義「外部可以傳進這個 Slider 的參數」
+// ------------------------------------------------------------
+type Props = {
+  label: string;
+  // label：顯示用文字，例如 "Income I" 或 "a (x exponent)"
+  // 作用：讓 UI 顯示「這個 slider 在控制什麼」
+
+  value: number;
+  // value：當前 slider 的值（受控組件的核心之一）
+  // 作用：決定
+  // 1) 原生 input 的 value（實際互動值）
+  // 2) 我們自己畫的 thumb/fill/tooltip 的位置與顯示
+
+  min: number;
+  // min：可選最小值
+  // 作用：
+  // 1) 原生 input 的最小值（使用者拖不到更小）
+  // 2) 用於計算 pct（value 在軌道中的比例）
+
+  max: number;
+  // max：可選最大值
+  // 作用：同 min（上界）
+
+  step?: number;
+  // step：每次跳動的最小單位（可選）
+  // 例如 a 用 0.01；Income 用 1
+  // 不一定每個 slider 都需要，所以標成可選（?）
+
+  onChange: (next: number) => void;
+  // onChange：受控組件的核心之二
+  // 作用：當使用者拖動滑桿時，把「新值」回報給外部
+  // 外部（例如 AppView）收到 next 後，負責 setState + 通知 controller
+};
+
+// ------------------------------------------------------------
+// ControlledSlider 元件本體（function component）
+// ------------------------------------------------------------
+export function ControlledSlider(props: Props) {
+  // 將 props 解構（destructure）成單獨變數，寫起來更乾淨
+  const { label, value, min, max, step, onChange } = props;
+
+  // ----------------------------------------------------------
+  // 1) 計算 thumb 在軌道中的位置比例 pct（0~1）
+  // ----------------------------------------------------------
+
+  let pct = 0;
+  // pct = percentage（比例）
+  // 你可以把它想成「目前值在整個範圍[min,max]中的相對位置」
+  // 例如：
+  // - value=min => pct=0（最左）
+  // - value=max => pct=1（最右）
+  // - value 在中間 => pct 在 0~1
+
+  const denom = max - min;
+  // denom = 分母（range 的寬度）
+  // 用於避免你直接除以 (max-min) 時，發生 max=min 的除以 0
+
+  if (denom > 0) {
+    pct = (value - min) / denom;
+    // 這是標準線性映射公式：
+    // 把 value 從 [min,max] 映射到 [0,1]
+    //
+    // 例：
+    // min=0.1 max=0.9 value=0.5
+    // denom=0.8
+    // pct=(0.5-0.1)/0.8=0.5 => 正中間
+  }
+
+  // ----------------------------------------------------------
+  // 2) clamp：把 pct 限制在 0~1（防呆）
+  // ----------------------------------------------------------
+  // 為什麼要 clamp？
+  // - 把一個數字強制卡在 [最小值, 最大值] 之間，不讓它超出去
+  // - 受控組件的 value 來自外部
+  // - 外部有可能傳進超出範圍的值（例如 value=999）
+  // 若不 clamp，thumb 會跑出軌道外（UI 變形）
+
+  if (pct < 0) {
+    pct = 0;
+  }
+  if (pct > 1) {
+    pct = 1;
+  }
+
+  const leftPercent = `${pct * 100}%`;
+  // leftPercent：把 0~1 的比例轉成 CSS 可用的百分比字串
+  // 例如 pct=0.5 => "50%"
+  // 這會用在：
+  // - fill 寬度
+  // - thumb 的 left
+  // - tooltip 的 left
+  // 
+  // 等價於: "const leftPercent = String(pct * 100) + "%";"
+
+  // ----------------------------------------------------------
+  // 3) handleChange：處理原生 input 的 onChange 事件
+  // ----------------------------------------------------------
+  function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
+    // e 是事件物件（event object）
+    // 這裡用 React.ChangeEvent<HTMLInputElement> 的目的 (TS 型別註記)：
+    // - 告訴 TypeScript：e.currentTarget 是 HTMLInputElement
+    // - 因此 e.currentTarget.value 是 string（HTML 規格就是 string）
+
+    const next = Number(e.currentTarget.value);
+    // 為什麼要 Number(...)？
+    // - 即使 input 是 range，e.currentTarget.value 仍然是「字串」
+    //   例如 "0.53"
+    // - 但你外部希望接到 number 才能計算/存到 state
+    // - 所以要轉型成 number
+
+    onChange(next);
+    // 受控組件的關鍵：元件自己「不保存」value
+    // 它只把 next 回報給外部 (交給 Parent Component 進行渲染)
+    // 外部 setState 後再把新的 value 傳回來
+  }
+
+  // ----------------------------------------------------------
+  // 4) render：畫出 slider（外觀 + 透明 input）
+  // ----------------------------------------------------------
+  return (
+    // 回傳 JSX Element Tree
+    // slider 的設計邏輯: track(底) + fill(疊) + thumb(疊) + tooltip(疊) + input(最上層透明疊)
+    // 外觀容器（relative, height 28）
+    //   - track 容器（relative, height 8） ← 就在這裡加
+    //     - fill（absolute）
+    //     - thumb（absolute）
+    //     - tooltip（absolute）
+    //   - 透明 input（absolute, inset 0）
+    <div style={{ width: 260 }}>
+      {/* 顯示 label 與目前 value（純顯示，不負責互動） */}
+      <div style={{ marginBottom: 8, fontSize: 14 }}>
+        <span>{label}: </span>
+        <span style={{ fontFamily: "inherit" }}>{value}</span>
+        {/* inherit 將字體繼承自 index.css 來統一設定 */}
+      </div>
+
+      {/* 外觀容器 (實際看到的 slider)：用 relative 讓子元素能 absolute 定位 */}
+      <div
+        style={{
+          position: "relative",
+          height: 28,
+          display: "flex",
+          alignItems: "center",
+        }}
+      >
+        {/* track 容器：你自己畫的軌道 */}
+        <div
+          style={{
+            position: "relative",
+            width: "100%",
+            height: 8,
+            borderRadius: 999,
+            background: "rgba(255,255,255,0.12)",
+            outline: "1px solid rgba(255,255,255,0.12)",
+          }}
+        >
+          {/* fill：已走過的部分（從 0 到目前 leftPercent）(表示軌道上目前值走到哪「亮起來」的那段) */}
+          <div
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              height: "100%",
+              width: leftPercent,
+              borderRadius: 999,  // 將邊角設為最大圓角
+              background: "rgba(255,255,255,0.55)",
+            }}
+          />
+            
+          {/* thumb：滑塊（用 leftPercent 定位）*/}
+          <div
+            style={{
+              position: "absolute",
+              top: "50%",
+              left: leftPercent,
+              transform: "translate(-50%, -50%)",
+              // translate(-50%, -50%) 的目的：
+              // left 指的是「thumb 左上角」的位置
+              // 但我們希望 left 指的是「thumb 中心」
+              // 所以往左移半個寬、往上移半個高
+
+              width: 18,
+              height: 18,
+              borderRadius: 999,
+              background: "white",
+              boxShadow: "0 2px 10px rgba(0,0,0,0.35)",
+            }}
+          />
+
+          {/* tooltip：顯示值（純顯示，可移除） */}
+          <div
+            style={{
+              position: "absolute",
+              left: leftPercent,
+              top: -26,
+              transform: "translateX(-50%)",
+              // 讓 tooltip 的中心對齊 thumb 的中心
+
+              padding: "2px 6px",
+              borderRadius: 6,
+              fontSize: 12,
+              background: "rgba(0,0,0,0.65)",
+              color: "white",
+              pointerEvents: "none",
+              // pointerEvents: "none" 的目的：
+              // tooltip 不要擋到滑鼠事件（不然拖曳會被 tooltip 截走）
+
+              fontFamily: "monospace",
+            }}
+          >
+            {value}
+          </div>
+          {/* 測試文字
+          <span style={{ fontSize: 12, marginLeft: 6 }}>TEST</span> */}
+
+        </div>
+
+        {/* 透明 input：真正處理互動的核心元件 */}
+        <input
+          type="range"
+          // HTML 原生 slider 元素
+
+          aria-label={label}
+          // aria-label：無障礙用途，讓螢幕閱讀器知道這個 slider 在控制什麼
+
+          min={min}
+          max={max}
+          step={step}
+          // min/max/step：不是「為了外觀」而放，而是：
+          // 1) 限制使用者能選到的值（UI 護欄）
+          // 2) 決定鍵盤左右鍵、拖曳時的步進
+
+          value={value}
+          // 受控組件：input 的 value 永遠以外部傳入的 value 為準
+
+          onChange={handleChange}
+          // input 發生變動 -> 呼叫 handleChange -> onChange(next) 回報外部
+
+          style={{
+            position: "absolute",
+            inset: 0,
+            // inset: 0 等價於：top:0; right:0; bottom:0; left:0;
+            // 讓透明 input 完整覆蓋整個外觀容器，任何地方都能拖
+
+            width: "100%",
+            height: "100%",
+            opacity: 0,
+            // opacity:0 讓 input 看不到，但仍然存在、仍可互動
+
+            cursor: "pointer",      // 滑鼠移上去仍顯示手指
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+"
+3. drawable.ts: "/* drawable.ts */
+//   - 定義 drawables 的資料格式 (line/point/text/...)
+//   - 通用「可畫圖元」：完全不依賴 React / SVG / Canvas，只需要遵守同一份 Drawable 規格
+//   - 它不綁任何渲染技術 (React/SVG/Canvas)，所以:
+//     - 可以用 SVG renderer
+//     - 可以用 Canvas renderer
+//     - 可以用 WebGL ...
+
+// 定義一個 二維向量 / 座標
+export type Vec2 = { x: number; y: number };
+
+// 線條樣式 (可選，以下屬性皆添加"?")
+export type StrokeStyle = {
+  width?: number;
+  dash?: number[];
+  color?: string;
+};
+
+// 填滿樣式 (可選)
+export type FillStyle = {
+  color?: string;
+};
+
+// 線段
+export type LineDrawable = {
+  kind: "line";  // 辨識標籤，告訴 renderer，這筆資料是一條線 (renderer 會 透過 switch (d.kind) 決定怎麼畫)
+  id: string;    // 唯一識別 (Ex: budget)
+  a: Vec2;       // 線段端點 (像素座標)
+  b: Vec2;
+  stroke?: StrokeStyle;  // 可選線條樣式
+};
+
+// 折線 (點列)
+export type PolylineDrawable = {
+  kind: "polyline";        // 折線
+  id: string;
+  points: Vec2[];          // 很多點串起來 (Ex: 無意曲線的取樣點)
+  stroke?: StrokeStyle;    // 線條樣式 (通常無異曲線也是線)
+};
+
+// 點 (通常化成圓)
+export type PointDrawable = {
+  kind: "point";           // 表示「點」
+  id: string;
+  center: Vec2;            // 點的位置 (圓心)
+  r: number;               // 半徑
+  fill?: FillStyle;        // 填色
+  stroke?: StrokeStyle;    // 圓的外框
+};
+
+// 文字
+export type TextDrawable = {
+  kind: "text";            // 文字 drawable
+  id: string;
+  pos: Vec2;               // 文字的定位點 (SVG <text x= y=> 的那個座標)
+  text: string;            // 要顯示的文字內容
+  fontSize?: number;       // 可選字體大小
+  fill?: FillStyle;        // 文字顏色 (可以跟預算線同色)
+  draggable?: boolean;     // 文字是否可以拖曳 (方程式標籤用)
+};
+
+// union type: Drawable 可以是以下4種其中之一
+export type Drawable =
+  | LineDrawable
+  | PolylineDrawable
+  | PointDrawable
+  | TextDrawable;
+
+export type SceneOutput = {
+  width: number;
+  height: number;
+  drawables: Drawable[];
+
+  // 讓外部也知道這張圖的經濟座標範圍，Ex: [0, xMax]、[0, xMin]
+  xDomain: [number, number];
+  yDomain: [number, number];
+};
+
+"
+4. layout.ts: "/* types.ts */
+//   - 放 UI 會用到的型別，它不是資料流主角，但讓型別一致
+
+export type Point = { x: number; y: number };
+
+export type Margin = {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+};
+"
+5. Viewport.ts: "/* Viewport.ts */
+
+// 經濟座標 -> 像素座標（不依賴 React）
+// 注意：螢幕座標 y 往下變大，所以這裡把 y 反轉
+export class Viewport {
+  private readonly svgInnerWidth: number;
+  private readonly svgInnerHeight: number;
+  private readonly xEconDomain: [number, number];
+  private readonly yEconDomain: [number, number];
+
+  // 建構子
+  constructor(
+    svgInnerWidth: number,
+    svgInnerHeight: number,
+    xEconDomain: [number, number],  // 經濟座標 x 的範圍
+    yEconDomain: [number, number],  // 經濟座標 y 的範圍
+  ) {
+    this.svgInnerWidth = svgInnerWidth;
+    this.svgInnerHeight = svgInnerHeight;
+    this.xEconDomain = xEconDomain;
+    this.yEconDomain = yEconDomain;
+  }
+  
+  // =========================================================
+  // 公開 getter：讓 View(AxesView) 讀得到 domain/size
+  // =========================================================
+  // 內容區寬度 (innerW)
+  getInnerWidth(): number {
+    return this.svgInnerWidth;
+  }
+
+  // 內容區高度 (innerH)
+  getInnerHeight(): number{
+    return this.svgInnerHeight
+  }
+
+  // 取得 xDomain (經濟座標 x 的範圍)
+  getXEconDomain(): [number, number] {
+    return this.xEconDomain;
+  }
+
+  // 取得 yDomain (經濟座標 y 的範圍)
+  getYEconDomain(): [number, number] {
+    return this.yEconDomain;
+  }
+
+
+  // x (方法)
+  //   - linear mapping: (v - d0)/(d1 - d0) 
+  //     - 1. (v - d0): 把 v 平移以 d0 為 0 的座標
+  //     - 2. / (d1 - d0): 把它「正規化」到 0-1 之間的比例 t
+  //     - 3. *this.width: 把 0-1 的比例拉伸到 0-width 的像素
+  xEconToXPixel(xEconValue: number): number {
+    const d0 = this.xEconDomain[0];  // 最小 x
+    const d1 = this.xEconDomain[1];  // 最大 x
+
+    // 防呆: 防止除以 0
+    if (d1 === d0) {
+      return 0;
+    }
+
+    return ((xEconValue - d0) / (d1 - d0)) * this.svgInnerWidth;
+  }
+
+  yEconToYPixel(yEconValue: number): number {
+    const d0 = this.yEconDomain[0];
+    const d1 = this.yEconDomain[1];
+
+    // 防呆: 防止除以 0
+    if (d1 === d0) {
+      return 0;
+    }
+
+    const t = (yEconValue - d0) / (d1 - d0);
+    return this.svgInnerHeight * (1 - t);  // "* (1-t)": 反轉
+  }
+
+  // map: 把一個點 (x,y) 轉換成像素點
+  econToPixelMapping(p: { x: number; y: number }) {  // p 是一個點物件，至少要有 {x,y}
+    return { x: this.xEconToXPixel(p.x), y: this.yEconToYPixel(p.y) };  // 回傳也是 {x,y}，但是已經是像素座標
+  }
+
+  // unmap: 像素座標 -> 經濟座標 (互動性操作)
+  pixelToEconMapping(p: { x: number; y: number }) {
+    const x = this.unmapX(p.x);
+    const y = this.unmapY(p.y);
+    return { x, y };
+  }
+
+  // 像素 x 轉回 經濟 x
+  private unmapX(px: number): number {
+    const d0 = this.xEconDomain[0];
+    const d1 = this.xEconDomain[1];
+
+    // 防呆機制
+    if (this.svgInnerWidth === 0) {
+      return d0;
+    }
+    if (d1 === d0) {
+      return d0;
+    }
+
+    const t = px / this.svgInnerWidth;
+    return d0 + t * (d1 - d0);
+  }
+
+  // 像素 y 轉回 經濟 y
+  private unmapY(py: number): number {
+    const d0 = this.yEconDomain[0];
+    const d1 = this.yEconDomain[1];
+
+    if (this.svgInnerHeight === 0) {
+      return d0;
+    }
+    if (d1 === d0) {
+      return d0;
+    }
+    
+    // 注意：y 方向有反轉，所以 t = 1 - (py / height)
+    const t = 1 - py / this.svgInnerHeight;
+    return d0 + t * (d1 - d0);
+  }
+}
+"
+6. consumer.ts: "/* consumer.ts */
+//   - 模型計算層: 負責經濟學計算
+//   - 最適消費束: x* = aI/px, y* = (1-a)I/py
+//   - 預算線截距端點: (I/px,0), (0,I/py)
+//   - 效用值: U = x^a y^(1-a)
+//   - 無異曲線取樣: 給 U0 算出一串 (x,y) 點
+
+// Point 型別
+//   - type: TypeScript 的型別別名
+//   - {x: number; y: number}: 表示「有兩個欄位 x and y，且都是 number」的物件
+//   - export 讓別的檔案可以 import {Point} ... 來使用
+export type Point = { x: number; y: number };
+
+// 計算 最適合消費點
+// Cobb-Douglas: U = x^a * y^(1-a)
+// 需求：x* = a * I / px, y* = (1-a) * I / py
+//   - export function ...: 輸出一個函式，使外部能夠呼叫
+//   - "params: {...}": 函式只收到「一個參數」params，它是一個物件，裡面必須要有 a, I, px, py
+export function cobbDouglasOptimum(params: {
+  a: number; // 0<a<1
+  I: number;
+  px: number;
+  py: number;
+}): Point {  // 回傳值型別是 Point，也就是 {x:number, y:number}
+  // 解構賦值 (destructuring): 從 params 物件裡取出同名欄位，變成 4 個局部變數
+  // 等價於: "const a = param.a;
+  //         const I = param.I;
+  //         const px = param.px;
+  //         const py = param.py;"
+  const { a, I, px, py } = params;
+
+  // Marshall Demand function
+  const x = (a * I) / px;
+  const y = ((1 - a) * I) / py;
+
+  return { x: x, y: y };
+}
+
+// 預算線兩個截距端點
+// 預算線：px x + py y = I
+// 用兩個截距點表達線段： (I/px, 0), (0, I/py)
+//   - 輸入參數 parms: I, px, py
+export function budgetLineEndpoints(params: {
+  I: number;
+  px: number;
+  py: number;
+}): { p1: Point; p2: Point } {  // 回傳型別
+  // 解構賦值 (destructuring)
+  const { I, px, py } = params;
+  return {
+    p1: { x: I / px, y: 0 },  // x-intercept
+    p2: { x: 0, y: I / py },  // y-intercept
+  };
+}
+
+// 取樣無異曲線點陣列
+// 生成一條通過最適點的無異曲線（簡化做法）
+// Cobb-Douglas: U = x^a y^(1-a)
+// 若給定 U0，則 y = (U0 / x^a)^(1/(1-a))
+export function indifferenceCurvePoints(params: {
+  a: number;
+  U0: number;
+  xMin: number;
+  xMax: number;
+  n: number;
+}): Point[] {  // 回傳 Point[]: 一串點
+  // Destructuring
+  const { a, U0, xMin, xMax, n } = params;
+  
+  // 宣告陣列 pts，之後會將每個取樣點 push 進去
+  const pts: Point[] = [];
+  const step = (xMax - xMin) / (n - 1);  // 在 [xMin, xMax] 之間取 n 個點，共 n-1 個間隔
+
+  let i = 0;
+  while (i < n) {
+    const x = xMin + step * i;
+    const y = Math.pow(U0 / Math.pow(x, a), 1 / (1 - a));
+    if (Number.isFinite(y)) {  // 檢查 y 是否為有限數: 確認不是Infinity、不是-Infinity、不是NaN
+      pts.push({ x, y });
+    }
+    i += 1;
+  }
+
+  return pts;
+}
+
+// 效用函數
+//   - 輸入: a, x, y
+//   - 回傳: 效用值
+//   - 計算: U = x^{\alpha} y^{1-\alpha}
+export function utilityCobbDouglas(params: {
+  a: number;
+  x: number;
+  y: number;
+}): number {
+  const { a, x, y } = params;
+  return Math.pow(x, a) * Math.pow(y, 1 - a);
+}
+"
+7. ConsumerOptController.ts: "// src/mvc/controller/ConsumerOptController.ts
+
+// 1) SceneOutput / Drawable：這是 View 會吃的「畫圖資料規格」
+//    - SceneOutput: {width, height, drawables, xDomain, yDomain}
+//    - Drawable: line/polyline/point/text 之一
+//    Controller 產生 SceneOutput，View 只負責 render。
+import type { SceneOutput, Drawable } from "../../core/drawables";
+
+// 2) Viewport：座標系轉換器
+//    - econ(x,y) -> pixel(x,y) 用 map
+//    - pixel -> econ 用 unmap
+//    這是拖曳互動的核心工具：使用者拖的是像素，但模型要用經濟座標。
+import { Viewport } from "../../core/Viewport";
+
+// 3) Model：負責持有參數 + 經濟計算
+//    Controller 不直接算 Cobb-Douglas，而是叫 model 幫你算。
+//    這是 MVC 的核心：
+//    - Model：算
+//    - Controller：協調（接事件、更新 model、產 scene、通知 view）
+//    - View：畫
+import { ConsumerOptModel } from "../model/ConsumerOptModel";
+
+// 4) Listener：訂閱者（通常是 View）
+//    Controller 內部維護 listeners，當 scene 更新時通知。
+//    (scene: SceneOutput) => void 表示：收到新 scene 後做些事情（例如 setState）。
+type Listener = (scene: SceneOutput) => void;
+
+type PixelOffset = { dx: number; dy: number };
+
+
+export class ConsumerOptController {
+  // ---------------------------
+  // Controller 的「持久狀態」
+  // ---------------------------
+
+  // 1) model：你整張圖的經濟模型與參數都放在這裡
+  // readonly：表示建構後不允許替換 model 物件（但 model 內部狀態仍可改）
+  private readonly model: ConsumerOptModel;
+
+  // 2) innerW/innerH：繪圖內容區（扣掉 margin 後）的寬高
+  //    注意：這裡是「內容區」，不是整張 SVG 的 W/H
+  //    View 那邊通常會：
+  //      W=520/H=360 + margin，然後 innerW = W - margin.left - margin.right
+  private readonly innerW: number;
+  private readonly innerH: number;
+
+  // 3) listeners：訂閱者列表（通常是 GraphView）
+  //    只要 scene 重算，就會通知每個 listener。
+  private listeners: Listener[];
+
+  // 4) lastScene：快取（cache）
+  //    - 目的：避免每次 View 呼叫 getScene 都重算一次
+  //    - 只要參數變了（I/a），就 rebuildAndNotify 會把它更新
+  private lastScene: SceneOutput | null;
+
+  // 5) lastViewport: 和 lastScene 同步的「同一份座標轉換器」
+  private lastViewport: Viewport | null;
+
+  // 6) 線段顏色 (線與其方程式標籤會共用)
+  private budgetColor: string;
+  private indiffColor: string;
+
+  // 7) id -> 方程式標籤的「使用者拖曳 offset」 (相對於 anchor)
+  private labelOffsets: Record<string, PixelOffset>;
+
+
+  // ---------------------------
+  // 建構子：注入依賴（Dependency Injection）
+  // ---------------------------
+  constructor(args: {
+    innerWidth: number;
+    innerHeight: number;
+    model: ConsumerOptModel;
+  }) {
+    // 內容區寬高（畫圖區）
+    this.innerW = args.innerWidth;
+    this.innerH = args.innerHeight;
+
+    // 注入 model
+    this.model = args.model;
+
+    // 初始沒有訂閱者
+    this.listeners = [];
+
+    // 初始 scene 尚未生成（lazy build）
+    this.lastScene = null;
+
+    // 初始 viewport 尚未生成（lazy build）
+    this.lastViewport = null;
+
+    // 預設顏色
+    this.budgetColor = "#111111";
+    this.indiffColor = "#111111";
+
+    this.labelOffsets = {};
+  }
+
+  // ---------------------------
+  // 訂閱 / 取消訂閱：View 用
+  // ---------------------------
+
+  // subscribe(fn)：把 View 的 callback 放進 listeners
+  // View 通常在 constructor/componentDidMount 訂閱
+  subscribe(fn: Listener) {
+    this.listeners.push(fn);
+  }
+
+  // unsubscribe(fn)：把指定 listener 移除
+  // 你用 while + 手動 copy 的方式做 immutable-like 更新（不使用 filter）
+  // 好處：不會用到 break/continue，行為也可控
+  unsubscribe(fn: Listener) {
+    const next: Listener[] = [];
+    let i = 0;
+    while (i < this.listeners.length) {
+      const item = this.listeners[i];
+      // 只保留不是同一個 function 的 listener
+      if (item !== fn) {
+        next.push(item);
+      }
+      i += 1;
+    }
+    this.listeners = next;
+  }
+
+  // ---------------------------
+  // View 取 scene 的方法
+  // ---------------------------
+
+  // getScene：給 View 拿最新場景
+  // - 如果 lastScene 有值：回傳快取（不重算）
+  // - 如果沒有：呼叫 buildScene() 計算一次，並保存快取
+  //
+  // 這個 lazy build 的設計，使得：
+  // - Controller 剛建好但 View 還沒 render 時，不會先做重算
+  // - 只有真正需要畫圖時才算
+  getScene(): SceneOutput {
+    if (this.lastScene) {
+      return this.lastScene;
+    }
+    const scene = this.buildScene();
+    this.lastScene = scene;
+    return scene;
+  }
+
+  // =========================================================
+  // getViewport：提供 View 使用（AxesView 會用）
+  // - 確保 viewport 永遠和 lastScene 同步
+  // =========================================================
+  getViewport(): Viewport {
+    // 若尚未 build，先確保 scene.viewport 被建立
+    if (!this.lastScene || !this.lastViewport) {
+      // buildScene 內會同步更新 this.lastViewport
+      const scene = this.buildScene();
+      this.lastScene = scene;
+    }
+
+    // 此時 lastViewport 一定存在 (若不存在表示 buildScene 忘了更新)
+    if (!this.lastViewport) {
+      // 保險: 理論上不會發生
+      this.lastViewport = new Viewport(this.innerW, this.innerH, [0,1], [0,1]);
+    }
+
+    return this.lastViewport;
+  }
+
+
+  // =========================================================
+  // UI events (from View)
+  // 這些方法都是「View 事件入口」
+  // =========================================================
+
+  // slider：Income 改變
+  // - 更新 model
+  // - 重建 scene + 通知 view
+  onIncomeChange(nextI: number) {
+    this.model.setIncome(nextI);
+    this.rebuildAndNotify();
+  }
+
+  // slider：alpha 改變
+  onAlphaChange(nextA: number) {
+    this.model.setAlpha(nextA);
+    this.rebuildAndNotify();
+  }
+
+  // 拖曳互動：View 回報被拖曳的 point（以像素座標回報）
+  // - id: 哪一個點（你的 drawables 中 point 的 id）
+  // - pixel: 使用者當下拖曳的局部座標（在內容區 <g> 裡）
+  onPointDrag(id: string, pixel: { x: number; y: number }) {
+    // Debug
+    // console.log("[Controller] onPointDrag", id, pixel);
+    
+    // 目前你只允許拖 opt 這個點
+    // 其他點拖了也忽略（直接 return）
+    if (id !== "opt") {
+      return;
+    }
+
+    // // 先取得當前 scene（可能是 cache）
+    // const scene = this.getScene();
+
+    // // 用當前 scene 的 domain 建立 viewport
+    // // 這步很重要：因為 domain 會隨 I/px/py 改變，不能用舊 domain
+    // const vp = new Viewport(
+    //   this.innerW,
+    //   this.innerH,
+    //   scene.xDomain,
+    //   scene.yDomain
+    // );
+
+    // 不再 new Viewport，直接用「controller 當前的 viewport」
+    const vp = this.getViewport();
+
+    // 像素座標 -> 經濟座標
+    // 使用者拖曳的是 pixel，但你的經濟模型應該接 econ(x,y)
+    const econPoint = vp.pixelToEconMapping(pixel);
+    const xEcon = econPoint.x;
+    const yEcon = econPoint.y;
+
+    // ---------------------------------------------------------
+    // 關鍵：拖 opt 點要怎麼「回推 a」？
+    // ---------------------------------------------------------
+    // 你註解寫得很實在：有很多種定義方式
+    //
+    // 你現在採用的是一個簡單 proxy：
+    //   alpha ≈ x / (x + y)
+    //
+    // 解釋：
+    // - alpha 在 Cobb-Douglas 裡是「x 的權重」
+    // - 拖到越靠右（x 大），a 就越大
+    // - 拖到越靠上（y 大），a 就越小
+    //
+    // 這不是嚴格從 FOC 推回來的，但互動上直觀。
+    const denom = xEcon + yEcon;
+
+    // 防呆：避免 denom <= 0 時除以 0 或得到奇怪值
+    if (denom <= 0) {
+      return;
+    }
+
+    // 計算新的 a
+    let nextAlpha = xEcon / denom;
+
+    // clamp：限制 a 的範圍到 [0.1, 0.9]
+    // 因為 a=0 或 1 會讓 indifference curve / 效用等出現數值問題
+    // （例如 1/(1-a) 會爆掉）
+    if (nextAlpha < 0.1) {
+      nextAlpha = 0.1;
+    }
+    if (nextAlpha > 0.9) {
+      nextAlpha = 0.9;
+    }
+
+    // 更新 model 的 a
+    this.model.setAlpha(nextAlpha);
+
+    // 重建 scene + 通知 view（讓圖重畫、slider 也能同步）
+    this.rebuildAndNotify();
+  }
+
+  // ---------------------------------------------------------
+  // 拖曳：方程式標籤（text）
+  //  - 1 找出「這個標籤」對應的 anchor（例如預算線中點）
+  //  - 2 計算 offset = 使用者拖到的位置 - anchor
+  //  - 3 存起來（labelOffsets[id]）
+  //  - 4 rebuildScene 時把 offset 加回去（位置就會保留）
+  // ---------------------------------------------------------
+  onTextDrag(id: string, pixel: { x: number; y: number }) {
+    const scene = this.getScene();
+    const anchor = this.findLabelAnchor(scene.drawables, id);
+    if (!anchor) {
+      return;
+    }
+
+    const dx = pixel.x - anchor.x;
+    const dy = pixel.y - anchor.y;
+
+    this.labelOffsets[id] = { dx, dy };
+
+    // 標籤位置改了，需要通知 view 重新渲染
+    this.rebuildAndNotify();
+  }
+
+
+  // =========================================================
+  // UI events: prices
+  // - px / py 是模型參數，所以必須：
+  //   1) 更新 model
+  //   2) rebuildAndNotify() 重算 scene + 通知 view
+  // =========================================================
+  onPxChange(nextPx: number) {
+    // 取得目前的 py (保持不變)
+    const params = this.model.getModelParams();
+
+    // 防呆: 價格不能 <= 0
+    let px = nextPx;
+    if (px < 0.1) {
+      px = 0.1;
+    }
+
+    this.model.setPrices(px, params.py);
+    this.rebuildAndNotify();
+  }
+
+  onPyChange(nextPy: number) {
+    // 取得目前的 px (保持不變)
+    const params = this.model.getModelParams();
+
+    // 防呆: 價格不能 <= 0
+    let py = nextPy;
+    if (py < 0.1) {
+      py = 0.1
+    }
+
+    this.model.setPrices(params.px, py);
+    this.rebuildAndNotify();
+  }
+
+
+
+  // =========================================================
+  // Internals（Controller 內部工具方法）
+  // =========================================================
+
+  // rebuildAndNotify：重算場景 + 通知所有訂閱者
+  //
+  // 這是 MVC 裡 controller 最核心的動作：
+  // - model 變了
+  // - scene 必須更新
+  // - view 必須被通知重新 render
+  private rebuildAndNotify() {
+    // 重算並覆蓋快取 (buildScene 會同步更新 lastViewport)
+    this.lastScene = this.buildScene();
+
+    // 用 local 變數避免 TS 對 null 抱怨，也避免通知時被改動
+    const scene = this.lastScene;
+
+    // 逐一通知 listener
+    // listener 通常會 setState({scene}) 或同步 slider state 等
+    let i = 0;
+    while (i < this.listeners.length) {
+      const fn = this.listeners[i];
+
+      fn(scene);
+
+      i += 1;
+    }
+  }
+
+  
+  // ---------------------------------------------------------
+  // computePlotInnerSize(): 依 px/py 決定「plot 區域」像素寬高比例
+  // - arg:
+  //   1. width: 這次要畫圖的區域-像素寬度
+  //   2. height: 這次要畫圖的區域-像素高度
+  // 
+  //   - px 變大 → x 軸變短（相對於 y）
+  //   - py 變大 → y 軸變短（等價：x 相對變長）
+  //
+  // Let
+  //   plotWidth / plotHeight = py / px
+  //
+  // 同時：plotW/plotH 不能超出可用的 innerW/innerH
+  // 所以要在 availW×availH 裡，找「最大可放的矩形」
+  // ---------------------------------------------------------
+  private computePlotInnerSize(px: number, py:number): {
+    width: number;
+    height: number
+  } {
+    const availWidth = this.innerW;   // 可畫圖的區域 (像素寬度)
+    const availHeight = this.innerH;  // 可畫圖的區域 (像素高度)
+
+    // priceRatio = plotWidth / plotHeight
+    let priceRatio = 1;  // 預設 1，plot 區域的長寬比 = px 和 py 的比
+    // 防呆: px、py 需要大於 0
+    if (px > 0 && py > 0) {
+      priceRatio = py/px
+    }
+
+    // 避免極端比例讓圖接近消失 (可自行調整上下界)
+    //  - 如果出現: px/py 極端，priceRatio 可能非常大禍非常小，導致圖形變成一條線
+    if (priceRatio < 0.1) {
+      priceRatio = 0.1;
+    }
+    if (priceRatio > 10) {
+      priceRatio = 10;
+    }
+
+    const availRatio = availWidth / availHeight;
+
+    // 預設把 plot 塞滿整個可用區
+    let width = availWidth;
+    let height = availHeight;
+
+    if (availRatio > priceRatio) {
+      height = availHeight;
+      width = availHeight * priceRatio;
+    } else {
+      width = availWidth;
+      height = availWidth / priceRatio;
+    }
+
+    if (width < 1) {
+      width = 1;
+    }
+    if (height < 1) {
+      height = 1;
+    }
+
+    return {width, height};
+  }
+
+
+  // ---------------------------------------------------------
+  // findLabelAnchor: 找方程式標籤的 anchor（用目前 drawables 取，穩）
+  // - budget-eq -> budget line 的中點
+  // - indiff-eq -> indiff polyline 的中間點
+  // ---------------------------------------------------------
+  private findLabelAnchor(
+    drawables: Drawable[],
+    labelId: string
+  ): { x: number; y: number } | null {
+    if (labelId === "budget-eq") {
+      let i = 0;
+      while (i < drawables.length) {
+        const drawableType = drawables[i];
+        if (drawableType.kind === "line" && drawableType.id === "budget") {
+          return { x: (drawableType.a.x + drawableType.b.x)/2 , y: (drawableType.a.y + drawableType.b.y) / 2 };
+        }
+        i++;
+      }
+      return null;
+    }
+    
+    if (labelId === "indiff-eq") {
+      let i = 0;
+      while (i < drawables.length) {
+        const drawableType = drawables[i];
+        if (drawableType.kind === "polyline" && drawableType.id === "indiff") {
+          const n = drawableType.points.length;
+          if (n <= 0) {
+            return null;
+          }
+          const mid = Math.floor(n/2);
+          return { x: drawableType.points[mid].x, y: drawableType.points[mid].y };
+        }
+        i++;
+      }
+      return null;
+    }
+
+    if (labelId === "opt-label") {
+      let i = 0;
+      while (i < drawables.length) {
+        const d = drawables[i];
+        if (d.kind === "point" && d.id === "opt") {
+          // Opt 文字 anchor：跟著 opt 點走（稍微右上偏移）
+          return { x: d.center.x + 8, y: d.center.y - 8 };
+        }
+        i += 1;
+      }
+      return null;
+    }
+
+    if (labelId === "utility-eq") {
+      // utility-eq anchor：固定放在左上角（在 plot 內）
+      // 讓它預設不依賴任何線/曲線也能出現，這不是貼在線上，所以用固定位置（靠左上，避免跟 tick 擠）
+      return { x: 12, y: 18 };
+    }
+
+    return null;
+  }
+
+
+
+  // =========================================================
+  // 顏色變更: 線段 與 標籤一起變
+  // =========================================================
+  setBudgetColor(color: string) {
+    this.budgetColor = color;
+    this.rebuildAndNotify();
+  }
+
+  setIndiffColor(color: string) {
+    this.indiffColor = color;
+    this.rebuildAndNotify();
+  }
+
+
+  // =========================================================
+  // getModelParamsSnapshot：讓 View 讀到目前 model 參數
+  // - 目的：GraphView 初始化 slider(px/py) 的 state 用
+  // =========================================================
+  getModelParamsSnapshot() {
+    return this.model.getModelParams();
+  }
+
+  private formatNum(value: number): string {
+    // 避免方程式顯示一堆小數
+    return value.toFixed(2);
+  }
+
+  // 工具: anchor + offset (若曾拖曳就套用)
+  private resolveLabelPos(
+    labelId: string,
+    anchor: { x: number ; y: number },
+    defaultDx: number,
+    defaultDy: number
+  ): { x: number; y: number } {
+    const offset = this.labelOffsets[labelId];
+    let x = anchor.x + defaultDx;
+    let y = anchor.y + defaultDy;
+    if (offset) {
+      x = anchor.x + offset.dx;
+      y = anchor.y + offset.dy;
+    }
+    
+    return { x, y }
+  }
+
+
+  // =========================================================
+  // buildScene：把 model 的參數轉成 SceneOutput
+  //
+  // 這步「等價於你舊架構的 ConsumerOptScene.build()」
+  // 但 MVC/OOP 版本把它放進 controller（或你也可以拆成 SceneBuilder class）
+  // =========================================================
+  private buildScene(): SceneOutput {
+    // 取得 model 當前參數（I, px, py, a）
+    const p = this.model.getModelParams();
+
+    // 決定經濟座標最大範圍（多留 20% 邊界）
+    const xEconMax = (p.I / p.px) * 1.2;
+    const yEconMax = (p.I / p.py) * 1.2;
+
+
+    // 依 px/py 決定 plot 的像素大小 (軸長會跟著變)
+    const plotSize = this.computePlotInnerSize(p.px, p.py);
+
+
+    // 建立 viewport：經濟座標 -> 像素座標
+    const vp = new Viewport(plotSize.width, plotSize.height, [0, xEconMax], [0, yEconMax]);
+    this.lastViewport = vp;  // 同步更新 lastViewport
+
+
+    // 由 model 計算經濟元素
+    const budget = this.model.computeBudget();     // 預算線端點（經濟座標）
+    const optEcon = this.model.computeOptimum();       // 最適點（經濟座標）
+    const xEcon = optEcon.x;
+    const yEcon = optEcon.y;
+    const U0 = this.model.computeUtilityAt(xEcon, yEcon); // 最適效用
+
+    // 無異曲線取樣的 xMin：避免 x 太小造成 y 爆掉
+    const xMinCandidate = xEconMax * 0.05;
+    let xMin = 0.0001;
+    if (xMinCandidate > xMin) {
+      xMin = xMinCandidate;
+    }
+
+    // 取樣無異曲線（回傳 econ 點）
+    const curveEconPts = this.model.computeIndifferenceCurve(U0, xMin, xEconMax, 60);
+
+    // econ -> pixel（line/polyline/point 都要 pixel 才能畫）
+    const curvePxPts = curveEconPts.map((pt) => vp.econToPixelMapping(pt));
+    const optPx = vp.econToPixelMapping(optEcon);
+
+
+    // 先建 drawable 物件 (用來計算 label anchor)
+    // 預算線：line
+    const budgetLine: Drawable = {
+      kind: "line",
+      id: "budget",
+      a: vp.econToPixelMapping(budget.p1),
+      b: vp.econToPixelMapping(budget.p2),
+      stroke: { width: 2, color: this.budgetColor },
+    }
+    // 無異曲線：polyline
+    const indiffCurve: Drawable = {
+      kind: "polyline",
+      id: "indiff",
+      points: curvePxPts,
+      stroke: { width: 2, color: this.indiffColor },
+    }
+    // 最適點：point
+    const optPoint: Drawable = {
+        kind: "point",
+        id: "opt",
+        center: optPx,
+        r: 4,
+        fill: { color: "currentColor" },
+    }
+    // 最適點標記：text
+    const optText: Drawable = {
+        kind: "text",
+        id: "opt-label",
+        pos: { x: optPx.x + 8, y: optPx.y - 8 },
+        text: "Opt",
+        fontSize: 12,
+        fill: { color: "currentColor" },
+        draggable: true,
+    }
+
+    // 組裝 drawables：這就是 View 的「唯一輸入」（這就是 drawables.ts 的用途）
+    const drawables: Drawable[] = [
+      budgetLine,
+      indiffCurve,  // 需要 特別指出 indiffCurve 時，再添加
+      optPoint,
+      optText
+    ];
+
+    // TEST: 額外加一個紅色點
+    // drawables.push({
+    //   kind: "point",
+    //   id: "test",
+    //   center: { x: 50, y: 50 },
+    //   r: 6,
+    //   fill: { color: "red" },
+    // });
+
+
+    // ---------------------------------------------------------
+    //  utility equation（效用方程式）顯示
+    // ---------------------------------------------------------
+    const utilAnchor = this.findLabelAnchor(drawables, "utility-eq");
+    if (utilAnchor) {
+      const utilPos = this.resolveLabelPos("utility-eq", utilAnchor, 0, 0);
+      drawables.push({
+        kind: "text",
+        id: "utility-eq",
+        pos: utilPos,
+        // 顯示一般式 + 目前 a 值（用純文字，SVG 不做上標）
+        text: `U(x,y) = x^a y^(1-a),  a=${this.formatNum(p.a)}`,
+        fontSize: 12,
+        fill: { color: this.indiffColor },
+        draggable: true,
+      });
+    }
+
+
+
+    // ---------------------------------------------------------
+    // budget equation
+    // 方程式標籤（文字 drawable）
+    // - 可拖曳 draggable: true
+    // - 顏色 fill.color = 線段顏色
+    // - 位置 = anchor + offset（如果使用者拖過就保留）
+    // ---------------------------------------------------------
+    const tempDrawablesForAnchor = drawables.slice();  // 用來計算 anchor (目前已經有線/曲線)
+    const budgetAnchor = this.findLabelAnchor(tempDrawablesForAnchor, "budget-eq");
+    if (budgetAnchor) {
+      const budgetPos = this.resolveLabelPos("budget-eq", budgetAnchor, 10, -10);
+      drawables.push({
+        kind: "text",
+        id: "budget-eq",
+        pos: budgetPos,
+        text: `${this.formatNum(p.px)}x + ${this.formatNum(p.py)}y = ${this.formatNum(p.I)}`,
+        fontSize: 12,
+        fill: { color: this.budgetColor },
+        draggable: true,
+      });
+
+    }
+
+    // ---------------------------------------------------------
+    // indifference equation（無異曲線方程）顯示 + 可拖曳 + 顏色同步
+    // 以 Cobb-Douglas：U0 = x^a y^(1-a)
+    // => y = (U0 / x^a)^(1/(1-a))
+    // ---------------------------------------------------------
+    const indiffAnchor = this.findLabelAnchor(drawables, "indiff-eq");
+    if (indiffAnchor) {
+      const pos = this.resolveLabelPos("indiff-eq", indiffAnchor, 10, -10);
+      drawables.push({
+        kind: "text",
+        id: "indiff-eq",
+        pos,
+        text: `y = (U0 / x^a)^(1/(1-a)),  U0=${this.formatNum(U0)}`,
+        fontSize: 12,
+        fill: { color: this.indiffColor },
+        draggable: true,
+      });
+    }
+
+    // ---------------------------------------------------------
+    // 讓 opt-label 的「可拖曳偏移」真的生效：
+    // - 我們在 drawables 最後再把 opt-label 的 pos 修正成 anchor + offset
+    // - 這樣 Opt 文字可以被拖、且 opt 點移動時 anchor 也會跟著變
+    // ---------------------------------------------------------
+    const optAnchor = this.findLabelAnchor(drawables, "opt-label");
+    if (optAnchor) {
+      const pos = this.resolveLabelPos("opt-label", optAnchor, 0, 0);
+
+      let i = 0;
+      while (i < drawables.length) {
+        const d = drawables[i];
+        if (d.kind === "text" && d.id === "opt-label") {
+          // 直接覆蓋位置（不改其他屬性）
+          (d as any).pos = pos;
+        }
+        i += 1;
+      }
+    }
+
+
+
+    // 回傳 SceneOutput
+    return {
+      width: plotSize.width,
+      height: plotSize.height,
+      drawables,
+      xDomain: [0, xEconMax],
+      yDomain: [0, yEconMax],
+    };
+  }
+}
+"
+8. ConsumerOptModel.ts: "// src/mvc/model/ConsumerOptModel.ts
+
+// ------------------------------------------------------------
+// Model 層的任務：
+// 1) 保存「狀態」：I, px, py, a
+// 2) 提供「商業/領域計算」：預算線、最適點、效用、無異曲線
+//
+// Model 不應該知道 View，也不應該知道 SVG/React；
+// 它只做「經濟學世界」的事情（純計算 + 狀態）。
+// ------------------------------------------------------------
+
+// 從 lib/consumer 匯入純計算函式（不依賴 React）
+// 這些函式就是你原本 consumer.ts 的功能，只是放在 lib 層。
+// Model 只是包一層：把內部 params 拿出來丟進去算。
+import {
+  budgetLineEndpoints,     // 給 I, px, py 算預算線兩端點（經濟座標）
+  cobbDouglasOptimum,      // 給 a, I, px, py 算 Cobb-Douglas 最適點（經濟座標）
+  indifferenceCurvePoints, // 給 a, U0, xMin, xMax, n 算無異曲線取樣點（經濟座標）
+  utilityCobbDouglas,      // 給 a, x, y 算效用 U
+} from "../../lib/consumer";
+
+// ------------------------------------------------------------
+// ConsumerParams：Model 的核心狀態型別
+// - I : income（所得）
+// - px, py : 兩種商品價格
+// - a : Cobb-Douglas 中 x 的權重（0<a<1）
+// ------------------------------------------------------------
+export type ConsumerParams = {
+  I: number;
+  px: number;
+  py: number;
+  a: number;
+};
+
+// ------------------------------------------------------------
+// ConsumerOptModel：
+// - 內部持有 params
+// - 提供 getter/setter
+// - 提供 computeXxx()：把 params 餵給 lib/consumer 的純函式
+// ------------------------------------------------------------
+export class ConsumerOptModel {
+  // private：外部不能直接改 this.params
+  // 這是 OOP 的封裝：想改參數必須走 setIncome / setAlpha / setPrices
+  private ModelParams: ConsumerParams;
+
+  // 建構子：接收初始參數
+  constructor(initial: ConsumerParams) {
+    // this.params = initial 也可以，但會直接保留 reference
+    // 你用 {...initial} 代表「複製一份」，避免外部還握著同一個物件 reference
+    // （保護封裝，避免外部偷偷改 initial 影響 model）
+    this.ModelParams = { ...initial };
+  }
+
+  // ----------------------------------------------------------
+  // getModelParams：對外提供一份參數快照（snapshot）
+  // ----------------------------------------------------------
+  getModelParams(): Readonly<ConsumerParams> {
+    // 同樣用 {...this.params} 回傳複製品
+    // 避免外部拿到 reference 之後直接改內容（破壞封裝）
+    return { ...this.ModelParams };
+  }
+
+  // ----------------------------------------------------------
+  // setters：提供 Controller 更新參數的入口
+  // Controller 不應該直接碰 this.params，所以走這些方法
+  // ----------------------------------------------------------
+
+  // 設定收入
+  setIncome(I: number): void {
+    this.ModelParams.I = I;
+  }
+
+  // 設定 alpha（x 的權重）
+  setAlpha(a: number) {
+    this.ModelParams.a = a;
+  }
+
+  // 設定兩個價格
+  setPrices(px: number, py: number) {
+    this.ModelParams.px = px;
+    this.ModelParams.py = py;
+  }
+
+  // ----------------------------------------------------------
+  // computeXxx：領域計算（經濟學計算）
+  // Model 提供「以自身 params 為基礎」的計算捷徑
+  // ----------------------------------------------------------
+
+  // computeBudget：計算預算線兩端點
+  computeBudget() {
+    const p = this.ModelParams; // 取 params 的 reference（方便寫）
+    // 丟進 lib 的純函式計算
+    // 回傳通常是 {p1:{x,y}, p2:{x,y}}（經濟座標）
+    return budgetLineEndpoints({ I: p.I, px: p.px, py: p.py });
+  }
+
+  // computeOptimum：計算 Cobb-Douglas 最適點
+  computeOptimum() {
+    const p = this.ModelParams;
+    // 回傳通常是 {x, y}（經濟座標）
+    return cobbDouglasOptimum({ a: p.a, I: p.I, px: p.px, py: p.py });
+  }
+
+  // computeUtilityAt：給定任意 (x,y) 計算效用
+  // 注意：這裡的 x,y 是「經濟座標」，不是像素座標 (xEcon, yEcon)
+  computeUtilityAt(xEcon: number, yEcon: number): number {
+    const p = this.ModelParams;
+    // 回傳一個 number：U
+    return utilityCobbDouglas({ a: p.a, x: xEcon, y: yEcon });
+  }
+
+  // computeIndifferenceCurve：給定 U0，回傳無異曲線的取樣點
+  // - U0：要達到的效用水準
+  // - xMin/xMax：取樣 x 範圍（避免 x=0 造成數值爆炸）
+  // - n：取樣點數
+  //
+  // 回傳：Point[]（經濟座標點列）
+  computeIndifferenceCurve(U0: number, xMin: number, xMax: number, n: number) {
+    const p = this.ModelParams;
+    return indifferenceCurvePoints({ a: p.a, U0, xMin, xMax, n });
+  }
+}
+"
+9. axesTicks.tsx: "// src/mvc/view/axesTicks.tsx
+
+// ------------------------------------------------------------
+// 專門「生成刻度 JSX」
+// 也就是把原本 AxesView.render() 裡的 while/push 抽出來
+//
+// 1) AxesView.render() 會變短、更容易讀
+// 2) 刻度生成邏輯可以被其他圖表重用（未來你不只畫一張圖）
+// 3) 這裡是「純渲染邏輯」：不碰 state / 不碰 model / 不改 controller
+//
+// 重要概念：
+// - 這些函式只回傳 React.ReactNode[]（一堆 JSX）
+// - 誰來 render？AxesView 來 render
+// ------------------------------------------------------------
+
+import React from "react";
+import { Viewport } from "../../core/Viewport";
+
+// ------------------------------------------------------------
+// 你刻度文字的格式化函式：
+// 如果你未來想改成顯示整數、顯示 1 位小數、或加上單位，改這裡即可。
+// ------------------------------------------------------------
+export function formatTick(value: number) {
+    return value.toFixed(2);
+}
+
+// ------------------------------------------------------------
+// 視覺參數集中成一個型別：
+// 讓 buildXTicks / buildYTicks 的參數更乾淨、更 self-interpret
+// ------------------------------------------------------------
+export type TickStyle = {
+    tickLen: number;
+    fontSize: number;
+};
+
+// ------------------------------------------------------------
+// 刻度顯示控制：線 和 字體 分開
+// ------------------------------------------------------------
+export type TickVisibility = {
+    showTickLines: boolean;   // 刻度短線
+    showTickLabels: boolean;  // 刻度文字
+};
+
+
+// ------------------------------------------------------------
+// normalizeTicks：統一 ticks 的預設值與防呆
+// - ticks 沒傳 -> 預設 5
+// - ticks < 1 -> 強制變 1
+// ------------------------------------------------------------
+export function normalizeTicks(ticks?: number): number {
+    let safeTicks = ticks;
+    if (safeTicks === undefined) {
+        safeTicks = 5;
+    }
+    if (safeTicks < 1) {
+        safeTicks = 1;
+    }
+    return safeTicks;
+}
+
+// ------------------------------------------------------------
+// buildXTicks：建立 X 軸刻度（回傳 JSX 陣列）
+// - 把 xEconDomain（經濟座標範圍）平均切成 ticks 份
+// - 每一份算出一個 xEconVal
+// - 用 Viewport 把 xEconVal 轉成 xPixel
+// - 在 (xPixel, xAxisYPixel) 畫刻度線 + 文字
+//
+// 參數解釋：
+// - vp：負責把 econ -> pixel 的工具
+// - ticks：要切幾等分（5 等分）
+// - xAxisYPixel：X 軸那條線在畫面上的 yPixel（水平線，所以 y 最重要）
+// - xEconDomain：x 的經濟座標範圍 [min, max]
+// - style：刻度線長度、字體大小
+// ------------------------------------------------------------
+export function buildXTicks(args: {
+    vp: Viewport;
+    ticks: number;
+    xAxisYPixel: number;
+    xEconDomain: [number, number];
+    style: TickStyle;
+    visibility: TickVisibility;
+}): React.ReactNode[] {
+    const { vp, ticks, xAxisYPixel, xEconDomain, style, visibility } = args;
+
+    // 若線段和字體都不顯示，就不用產生任何 ticks (避免產生一對空 <g>)
+    if (!visibility.showTickLines && !visibility.showTickLabels) {
+        return [];
+    }
+
+    const xEconMin = xEconDomain[0];
+    const xEconMax = xEconDomain[1];
+    const xEconRange = xEconMax - xEconMin;
+
+    const xTickNodes: React.ReactNode[] = [];
+
+    let i = 0;
+    while (i <= ticks) {
+        const t = i / ticks; // 0..1 的比例
+        const xEconVal = xEconMin + t * xEconRange; // 這個刻度在經濟座標的值
+        const xPixel = vp.xEconToXPixel(xEconVal);  // 經濟座標 -> 像素座標
+
+        // 依照條件建立 Node List (刻度，包含線段與字體)
+        let tickLineNode: React.ReactNode | null = null;
+        if (visibility.showTickLines) {
+            tickLineNode = (
+                <line
+                    x1={xPixel}
+                    y1={xAxisYPixel}
+                    x2={xPixel}
+                    y2={xAxisYPixel + style.tickLen}
+                    stroke="currentColor"
+                />
+            );
+        }
+
+        let tickLabelNode: React.ReactNode | null = null;
+        if (visibility.showTickLabels) {
+            tickLabelNode = (
+                <text
+                    x={xPixel}
+                    y={xAxisYPixel + style.tickLen + style.fontSize}
+                    fontSize={style.fontSize}
+                    textAnchor="middle"
+                    fill="currentColor"
+                >
+                    {formatTick(xEconVal)}
+                </text>
+            );
+        }
+
+
+        xTickNodes.push(
+            <g key={`xtick-${i}`}>
+                {/* 刻度線：從 X 軸往下畫 tickLen */}
+                {/* <line
+                    x1={xPixel}
+                    y1={xAxisYPixel}
+                    x2={xPixel}
+                    y2={xAxisYPixel + style.tickLen}
+                    stroke="currentColor"
+                    /> */}
+
+                {/* 刻度文字：置中對齊 */}
+                {/* <text
+                    x={xPixel}
+                    y={xAxisYPixel + style.tickLen + style.fontSize}
+                    fontSize={style.fontSize}
+                    textAnchor="middle"
+                    fill="currentColor"
+                    >
+                    {formatTick(xEconVal)}
+                    </text> */}
+
+                {tickLineNode}
+                {tickLabelNode}
+            </g>
+        );
+
+        i += 1;
+    }
+
+    return xTickNodes;
+}
+
+// ------------------------------------------------------------
+// buildYTicks：建立 Y 軸刻度（回傳 JSX 陣列）
+// - 把 yEconDomain（經濟座標範圍）平均切成 ticks 份
+// - 每一份算出 yEconVal
+// - 用 Viewport 把 yEconVal 轉成 yPixel
+// - 在 (yAxisXPixel, yPixel) 畫刻度線 + 文字
+//
+// 參數解釋：
+// - yAxisXPixel：Y 軸那條線在畫面上的 xPixel（垂直線，所以 x 最重要）
+// ------------------------------------------------------------
+export function buildYTicks(args: {
+    vp: Viewport;
+    ticks: number;
+    yAxisXPixel: number;
+    yEconDomain: [number, number];
+    style: TickStyle;
+    visibility: TickVisibility;
+}): React.ReactNode[] {
+    const { vp, ticks, yAxisXPixel, yEconDomain, style, visibility } = args;
+
+    // 若線段和字體都不顯示，就不用產生任何 ticks (避免產生一對空 <g>)
+    if (!visibility.showTickLines && !visibility.showTickLabels) {
+        return [];
+    }
+
+    const yEconMin = yEconDomain[0];
+    const yEconMax = yEconDomain[1];
+    const yEconRange = yEconMax - yEconMin;
+
+    const yTickNodes: React.ReactNode[] = [];
+
+    let i = 0;
+    while (i <= ticks) {
+        const t = i / ticks; // 0..1 的比例
+        const yEconVal = yEconMin + t * yEconRange; // 這個刻度在經濟座標的值
+        const yPixel = vp.yEconToYPixel(yEconVal);  // 經濟座標 -> 像素座標
+
+        // 依照條件建立 Node List (刻度，包含線段與字體)
+        let tickLineNode: React.ReactNode | null = null;
+        if (visibility.showTickLines) {
+            tickLineNode = (
+                <line
+                    x1={yAxisXPixel}
+                    y1={yPixel}
+                    x2={yAxisXPixel - style.tickLen}
+                    y2={yPixel}
+                    stroke="currentColor"
+                />
+            );
+        }
+
+        let tickLabelNode: React.ReactNode | null = null;
+        if (visibility.showTickLabels) {
+            tickLabelNode = (
+                <text
+                    x={yAxisXPixel - style.tickLen - 2}
+                    y={yPixel + style.fontSize / 3}
+                    fontSize={style.fontSize}
+                    textAnchor="end"
+                    fill="currentColor"
+                >
+                    {formatTick(yEconVal)}
+                </text>
+            );
+        }
+
+
+        yTickNodes.push(
+            <g key={`ytick-${i}`}>
+                {/* 刻度線：從 Y 軸往左畫 tickLen */}
+                {/* <line
+                    x1={yAxisXPixel}
+                    y1={yPixel}
+                    x2={yAxisXPixel - style.tickLen}
+                    y2={yPixel}
+                    stroke="currentColor"
+                /> */}
+
+                {/* 刻度文字：右對齊貼近 y 軸 */}
+                {/* <text
+                    x={yAxisXPixel - style.tickLen - 2}
+                    y={yPixel + style.fontSize / 3}
+                    fontSize={style.fontSize}
+                    textAnchor="end"
+                    fill="currentColor"
+                >
+                    {formatTick(yEconVal)}
+                </text> */}
+
+                {tickLineNode}
+                {tickLabelNode}
+            </g>
+        );
+
+        i += 1;
+    }
+
+    return yTickNodes;
+}
+"
+10. AxesView.tsx: "// src/mvc/view/AxesView.tsx
+
+// ------------------------------------------------------------
+// View 層（React）元件：AxesView
+// 任務：只負責「把座標軸畫出來」
+// - 不做任何經濟計算
+// - 不做狀態管理
+// - 不依賴 Model/Controller
+//
+// 加入「五等分刻度」與「刻度文字」
+//
+// 這是典型 MVC 裡 View 的「純渲染元件」：
+// Controller/GraphView 算好 innerW/innerH + margin 後，丟給它畫。
+// ------------------------------------------------------------
+
+import React from "react";
+
+// 匯入 Margin 型別（讓 props.margin 有 top/right/bottom/left）
+// 這裡只 import type：只拿型別，不會進 bundle
+import type { Margin } from "../../core/types";
+
+// 匯入 Viewport: AxesView 直接使用 Viewport（同一套座標換算規則）
+import { Viewport } from "../../core/Viewport";
+
+// 匯入 刻度生成工具
+import {
+  buildXTicks,
+  buildYTicks,
+  normalizeTicks,
+  type TickStyle,
+  type TickVisibility,
+} from "./axesTicks"
+
+// ------------------------------------------------------------
+// Props：AxesView 的輸入
+// - width/height：內容區(inner)的寬高（不是整張 SVG 外框）
+// - margin：留白（用來把座標軸放到內容區的左上角偏移）
+//
+// - ticks：想要幾等分（你要 5）
+//   畫出 i=0..ticks 共 ticks+1 個刻度點
+//   例如 ticks=5 -> 0,1,2,3,4,5 共 6 個刻度點（五等分）
+// ------------------------------------------------------------
+type Props = {
+  // 不再傳 width/height/xDomain/yDomain，改傳 viewport
+  // width: number;
+  // height: number;
+  // xDomain: [number, number];
+  // yDomain: [number, number];
+  viewport: Viewport;
+
+  margin: Margin;
+
+  ticks?: number,
+
+  tickVisibility?: TickVisibility;  // 線段/字體獨立控制
+
+  // plot 區 可用 inner 區塊內的偏移(用於置中)
+  // 這個 offset 是「已扣掉 margin 的內容區」內的位移量(往右、往下)
+  offset?: { x: number; y: number };
+
+  // 軸變數名稱
+  xLabel?: string;
+  yLabel?: string;
+};
+
+
+// ------------------------------------------------------------
+// class component（OOP）版本的 View
+// - extends React.Component<Props>：表示這個 component 只收 props，不使用 state
+//   （如果你要 state，可以寫 React.Component<Props, State>）
+// ------------------------------------------------------------
+export class AxesView extends React.Component<Props> {
+  // 工具: 估算文字寬度 (不用 DOM measurement)
+    // 每個字寬約 0.6 em
+    private approxTextWidth(text: string, fontSize: number): number {
+      return text.length * fontSize * 0.6;
+    }
+  
+  // render()：class component 必備方法
+  // React 會在「第一次掛載」或「props 改變」時呼叫 render 重新產出 JSX
+  render() {
+
+    // --------------------------------------------------------
+    // 把 props 解出來，讓下面 JSX 讀起來更清楚
+    // 也可以用解構：const { width, height, margin } = this.props;
+    // 解構讀取 xDomain 與 yDomain
+    //
+    // [修改]: 改從 viewport 取得 size/domain (同一份座標系)
+    // --------------------------------------------------------
+    
+    const vp = this.props.viewport;
+    const svgInnerWidth = vp.getInnerWidth();      // 內容區寬度
+    const svgInnerHeight = vp.getInnerHeight();    // 內容區高度
+    const xEconDomain = vp.getXEconDomain();  // 經濟座標 x 的範圍 [xMin, xMax]
+    const yEconDomain = vp.getYEconDomain();  // 經濟座標 y 的範圍 [yMin, yMax]
+
+    const margin = this.props.margin;
+    
+
+    // normalizeTicks(): ticks 的預設與防呆機制
+    const ticks = normalizeTicks(this.props.ticks);
+
+    // 刻度視覺參數 (集中成 TickStyle)
+    const style: TickStyle = {
+      tickLen: 6,
+      fontSize: 11
+    }
+
+    // 預設: 線段與字體皆顯示
+    let visibility = this.props.tickVisibility;
+    if ( visibility === undefined ) {
+      visibility = { showTickLines: true, showTickLabels: true}
+    }
+
+    // offset 預設 0
+    let offset = this.props.offset;
+    if (offset === undefined) {
+      offset = { x: 0, y: 0 };
+    }
+
+
+    // --------------------------------------------------------
+    // xAxisY / yAxisX ：
+    //
+    // 1) X 軸是「水平線」——水平線的位置由「y」決定
+    //   (X 軸是一條水平線，所以它最重要的是「它的 y 值是多少」)
+    //    所以 xAxisY 的意思是：
+    //    「X 軸那條水平線，在畫面上的 yPixel 在哪裡？」
+    //
+    // 2) Y 軸是「垂直線」——垂直線的位置由「x」決定
+    //   (Y 軸是一條垂直線，所以它最重要的是「它的 x 值是多少」)
+    //    所以 yAxisX 的意思是：
+    //    「Y 軸那條垂直線，在畫面上的 xPixel 在哪裡？」
+    //
+    // 我們用 Viewport 把「經濟座標的 0」換成像素：
+    // - yEcon=0 => yPixel (就是 x 軸的位置)
+    // - xEcon=0 => xPixel (就是 y 軸的位置)
+    // --------------------------------------------------------
+    const xAxisYPixel = vp.yEconToYPixel(0);  // 經濟座標 y=0 的 y 像素座標
+    const yAxisXPixel = vp.xEconToXPixel(0);  // 經濟座標 x=0 的 x 像素座標
+
+
+    const xTickNodes = buildXTicks({
+      vp,
+      ticks,
+      xAxisYPixel,
+      xEconDomain,
+      style,
+      visibility,
+    });
+
+    const yTickNodes = buildYTicks({
+      vp,
+      ticks,
+      yAxisXPixel,
+      yEconDomain,
+      style,
+      visibility,
+    });
+
+    // 軸標籤預設值
+    const xLabel = this.props.xLabel ? this.props.xLabel: "x";
+    const yLabel = this.props.yLabel ? this.props.yLabel: "y";
+
+
+    
+    // --------------------------------------------------------
+    // 避免 yLabel 與 tick label 重疊 + 超出畫布：
+    // 1) 估算 y 軸 tick label 的最大寬度（用 yDomain 最大值當代表）
+    // 2) yLabel 放在 y 軸中間（避免上方超出）
+    // 3) yLabel 再往左退：tickLen + tickLabelWidth + padding
+    // 4) 若 yLabel 太長（旋轉後沿垂直方向），就自動縮小字體
+    // --------------------------------------------------------
+    const tickFont = style.fontSize;
+
+    const maxAbsX = Math.max(Math.abs(xEconDomain[0]), Math.abs(xEconDomain[1]));
+    const maxAbsY = Math.max(Math.abs(yEconDomain[0]),Math.abs(yEconDomain[1]));
+    const tickXSample = maxAbsX.toFixed(2);
+    const tickYSample = maxAbsY.toFixed(2);
+    // const tickXLabelWidth = this.approxTextWidth(tickXSample, tickFont);
+    const tickYLabelWidth = this.approxTextWidth(tickYSample, tickFont);
+
+    // xLabel，yLabel 預設字體大小
+    let xLabelFontSize = 12;
+    let yLabelFontSize = 12;
+
+    const xLabelNeed = this.approxTextWidth(xLabel, xLabelFontSize);
+
+    // yLabel 旋轉後的「垂直占用長度」約等於 文字寬度
+    const yLabelNeed =this.approxTextWidth(yLabel, yLabelFontSize);
+
+    // 如果太長，縮小字體 (下限 8)
+    const maxAllow = svgInnerHeight * 0.9;
+    if (xLabelNeed > maxAllow && xLabel.length > 0) {
+      const scaled = (maxAllow / (xLabel.length * 0.6));
+      if (scaled < xLabelFontSize) {
+        xLabelFontSize = Math.max(8, Math.floor(scaled));
+      }
+    }
+
+    if (yLabelNeed > maxAllow && yLabel.length > 0) {
+      const scaled = (maxAllow / (yLabel.length * 0.6));
+      if (scaled < yLabelFontSize) {
+        yLabelFontSize = Math.max(8, Math.floor(scaled));
+      }
+    }
+
+    // xLabel 放在 x 軸中間 與 yLabel 放在 y 軸中間
+    const xLabelCenterX = svgInnerWidth / 2;
+    const yLabelCenterY = svgInnerHeight / 2;
+
+    // 往左退更多，確保不壓到 tick label
+    const yLabelX = yAxisXPixel - style.tickLen - tickYLabelWidth - 18;
+
+
+    // --------------------------------------------------------
+    // 回傳 SVG 的 <g> 群組（group）
+    // 用 transform translate(margin.left, margin.top) 做位移：
+    // 目的：把座標軸放在「內容區」的左上角，而不是整個 SVG 的 (0,0)
+    //
+    // 假設你的外框 SVG 先畫了 margin，內容區才是 innerW/innerH，
+    // 那你把 <g> 往右下移動 margin.left/margin.top，
+    // 就能讓 (0,0) 對齊內容區左上角。
+    //
+    // margin：把座標軸放到內容區左上
+    // offset：把 plot 區在內容區內置中，確保 軸 和 圖 在同一個 plot 區座標系下
+    // --------------------------------------------------------
+    return (
+      <g transform={`translate(${margin.left + offset.x},${margin.top + offset.y})`}>
+        {/* -----------------------------------------------
+            x-axis：水平線
+            - 從 (0, height) 畫到 (width, height)
+            - 因為內容區的 y=0 在上方，y=height 在下方
+            - 所以 x 軸（底線）放在 y=height
+            ----------------------------------------------- */}
+        <line
+          x1={0}
+          y1={xAxisYPixel}
+          x2={svgInnerWidth}
+          y2={xAxisYPixel}
+          stroke="currentColor"
+        />
+
+        {/* -----------------------------------------------
+            y-axis：垂直線
+            - 從 (0, 0) 畫到 (0, height)
+            - 放在內容區最左邊（x=0）
+            ----------------------------------------------- */}
+        <line 
+          x1={yAxisXPixel} 
+          y1={0} 
+          x2={yAxisXPixel} 
+          y2={svgInnerHeight} 
+          stroke="currentColor" 
+        />
+
+        {/* 由 visibility 決定是否出現線/字體，畫出刻度（X 軸、Y 軸） */}
+        {xTickNodes}
+        {yTickNodes}
+
+        {/* ✅ X 軸變數名稱（放在右端附近） */}
+        <text       
+          x={xLabelCenterX}
+          y={xAxisYPixel + style.tickLen + style.fontSize * 2 + 8}
+          fontSize={xLabelFontSize}
+          textAnchor="middle"
+          fill="currentColor"
+        >
+          {xLabel}
+        </text>
+
+        {/* ✅ Y 軸變數名稱：置中 + 避開 tick label + rotate(-90) */}
+        <text
+          x={yLabelX}
+          y={yLabelCenterY}
+          fontSize={yLabelFontSize}
+          textAnchor="middle"
+          fill="currentColor"
+          // transform={`rotate(-90 ${yLabelX} ${yLabelCenterY})`}
+        >
+          {yLabel}
+        </text>
+      </g>
+    );
+  }
+}
+"
+11. ConsumerOptGraphView.tsx: "// src/mvc/view/ConsumerOptGraphView.tsx
+
+// ------------------------------------------------------------
+// ConsumerOptGraphView（View 層 / React class component）
+// 任務：
+// 1) 提供 SVG 畫布容器（W/H/margin/innerW/innerH）
+// 2) 管理 View 的 state(scene)：scene 一更新就 setState 觸發重畫
+// 3) 訂閱 Controller：controller 產生新 scene 時通知我
+// 4) 把 scene 丟給 SvgSceneView（renderer）去畫 drawables
+// 5) 接收 SvgSceneView 的互動事件（拖曳點）並轉交給 Controller
+//
+// 它不做經濟計算（那是 Model）
+// 它也不組裝 drawables（那是 Controller buildScene）
+// 它只負責「呈現 + UI 事件轉交 + 訂閱更新」
+// ------------------------------------------------------------
+
+import React from "react";
+
+// // Margin 型別：{top,right,bottom,left}
+// // margin 用於內容區偏移（座標軸、繪圖區留白）
+// import type { Margin } from "../../core/types";
+
+// AxesView：專門畫座標軸（只畫，不算）
+import { AxesView } from "./AxesView";
+
+// SvgSceneView：renderer，把 SceneOutput.drawables 畫成 SVG 元素
+import { SvgSceneView } from "./SvgSceneView";
+
+// SceneOutput：這張圖的「唯一渲染輸入」
+// 內含 drawables + xDomain/yDomain + width/height
+import type { SceneOutput } from "../../core/drawables";
+
+// Controller：GraphView 需要一個 controller 來取得 scene、訂閱更新、轉交拖曳事件
+import { ConsumerOptController } from "../controller/ConsumerOptController";
+
+// GraphView: GraphView 的 state 也保存 viewport
+import { Viewport } from "../../core/Viewport";
+
+import type { TickVisibility } from "./axesTicks";
+
+import { SVG_HEIGHT, SVG_MARGIN, SVG_WIDTH } from "../../core/layout";
+
+// // ------------------------------------------------------------
+// // ALLOWED_TICKS: 限制 ticks 值: 避免奇怪數字 (1, 2, 4, 5, 10)
+// // ------------------------------------------------------------
+// const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10]; 
+
+// ------------------------------------------------------------
+// Props：外部（通常是 AppView）必須傳入 controller
+// GraphView 不自己 new controller，避免把依賴鎖死
+// ------------------------------------------------------------
+type Props = {
+  controller: ConsumerOptController;
+
+  ticks: number;
+  tickVisibility: TickVisibility;
+
+  xLabel: string;
+  yLabel: string;
+
+  chartTitle: string;
+};
+
+// ------------------------------------------------------------
+// State：GraphView 自己持有目前的 scene
+// 這是 React class component 的典型模式：
+// - scene 變了 -> setState -> render 重新執行 -> 重畫 SVG
+// Viewport: 確保 Viewport 與 scene 同步
+// ------------------------------------------------------------
+type State = {
+  scene: SceneOutput;
+  viewport: Viewport;
+
+  // ticks: number;
+  // showTickLines: boolean;
+  // showTickLabels: boolean;
+};
+
+// ------------------------------------------------------------
+// ConsumerOptGraphView：class component（OOP）
+// extends React.Component<Props, State> 代表：
+// - props 型別是 Props
+// - state 型別是 State
+// ------------------------------------------------------------
+export class ConsumerOptGraphView extends React.Component<Props, State> {
+  // ----------------------------------------------------------
+  // 固定的「視圖配置」：svgWidth/svgHeight/svgMargin
+  //
+  // 用 private readonly：
+  //  - private：外部不能直接改（封裝）
+  //  - readonly：建構後不可變（避免 render 期間被改動）
+  // ----------------------------------------------------------
+  private readonly svgWidth: number;
+  private readonly svgHeight: number;
+
+  // private readonly svgMargin: Margin;
+  private readonly svgMargin = SVG_MARGIN;
+
+  private subscribedController: ConsumerOptController | null;
+
+  // 拿到 <svg> DOM 匯出使用
+  private svgRef: React.RefObject<SVGSVGElement | null>;
+
+  // ----------------------------------------------------------
+  // constructor：初始化 view 的常數、state、事件綁定、訂閱 controller
+  // ----------------------------------------------------------
+  constructor(props: Props) {
+    super(props); // 必須呼叫 super(props)，讓 React 初始化 Component
+
+    // SVG 外框尺寸（整張畫布）
+    this.svgWidth = SVG_WIDTH;
+    this.svgHeight = SVG_HEIGHT;
+
+    // 留白：讓座標軸 / 標籤可以放得下
+    // 內容區（inner）就是扣掉 margin 後的範圍，中間那塊「真正拿來畫圖的區域」
+    //  - innerW = W - margin.left - margin.right
+    //  - innerH = H - margin.top - margin.bottom
+    // 為甚麼要留白?
+    //  - 左邊要放 Y 軸的數字（刻度文字），不留白會被切掉
+    //  - 下方要放 X 軸的數字，不留白會被切掉
+    this.svgMargin = { top: 20, right: 20, bottom: 30, left: 40 };
+
+    // svg ref: 拿到真正的 <svg> DOM 節點
+    this.svgRef = React.createRef<SVGSVGElement>();
+
+    // --------------------------------------------------------
+    // 初始化 state.scene
+    // - props.controller.getScene()：向 controller 取得「目前最新」scene
+    // - getScene() 內部可能會 lazy build
+    // - 結果存進 state，第一次 render 就能畫出來
+    // --------------------------------------------------------
+    const scene = props.controller.getScene();
+    const viewport = props.controller.getViewport();
+
+    this.state = { 
+      scene, 
+      viewport,
+      // ticks: 5,
+      // showTickLines: true,
+      // showTickLabels: true,
+    };
+
+    // --------------------------------------------------------
+    // 綁定 this（class component 必做）
+    // 因為你下面會把 method 當 callback 傳遞出去：
+    // - controller.subscribe(this.handleSceneUpdate)
+    // - <SvgSceneView onPointDrag={this.handlePointDrag} />
+    //
+    // 若不 bind，method 內的 this 可能會變成 undefined（嚴格模式）
+    // --------------------------------------------------------
+    this.handleSceneUpdate = this.handleSceneUpdate.bind(this);
+    this.handlePointDrag = this.handlePointDrag.bind(this);
+
+    // bind Tick handlers
+    // this.handleOnTicksChange = this.handleOnTicksChange.bind(this);
+    // this.handleOnShowTickLinesChange = this.handleOnShowTickLinesChange.bind(this);
+    // this.handleOnShowTickLabelsChange = this.handleOnShowTickLabelsChange.bind(this);
+
+    // 文字拖曳
+    this.handleTextDrag = this.handleTextDrag.bind(this);
+
+
+    // // 匯出 SVG handler
+    // this.handleExportSvg = this.handleExportSvg.bind(this);
+
+    // --------------------------------------------------------
+    // 訂閱 controller：這就是你前面問的「訂閱者」！
+    //
+    // 你把一個 callback（handleSceneUpdate）交給 controller，
+    // controller 之後每次重算 scene 都會呼叫這個 callback(scene)。
+    //
+    // 所以：
+    // - 訂閱者（listener）= this.handleSceneUpdate 這個函式
+    // - 擁有者 = GraphView（View 層）
+    // --------------------------------------------------------
+    // props.controller.subscribe(this.handleSceneUpdate);
+    this.subscribedController = null;
+  }
+
+  // ----------------------------------------------------------
+  // componentDidMount：元件要卸載時解除訂閱
+  //
+  // 為什麼一定要做？ 
+  // 訂閱 controller：這就是你前面問的「訂閱者」！
+  //
+  // 你把一個 callback（handleSceneUpdate）交給 controller，
+  // controller 之後每次重算 scene 都會呼叫這個 callback(scene)。
+  //
+  // 所以：
+  // - 訂閱者（listener）= this.handleSceneUpdate 這個函式
+  // - 擁有者 = GraphView（View 層）
+
+  // ----------------------------------------------------------
+  componentDidMount() {
+    this.subscribedController = this.props.controller;
+    this.subscribedController.subscribe(this.handleSceneUpdate);
+
+    // mount 後再同步一次 scene + viewport
+    // 確保 mount 之後 scene 是最新的 state (避免 mount 前 controller 已經更新)
+    const scene = this.props.controller.getScene();
+    const viewport = this.props.controller.getViewport();
+    this.setState({ scene, viewport });
+  }
+
+
+  // ----------------------------------------------------------
+  // componentWillUnmount：元件要卸載時解除訂閱
+  //
+  // 為什麼一定要做？
+  // - 若不 unsubscribe，controller 仍保存這個 callback reference
+  // - 元件都消失了，controller 還呼叫 setState -> 會警告/記憶體洩漏
+  // ----------------------------------------------------------
+  componentWillUnmount() {
+    // this.props.controller.unsubscribe(this.handleSceneUpdate);
+
+    // 用當初訂閱的 controller 解除
+     if (this.subscribedController) {
+      this.subscribedController.unsubscribe(this.handleSceneUpdate);
+      this.subscribedController = null;
+     }
+  }
+
+  // ----------------------------------------------------------
+  // handleSceneUpdate：controller 通知「新 (lastest) scene」時會呼叫
+  //
+  // - 這個 method 會 setState
+  // - setState 會觸發 render
+  // - render 會把新 scene 丟進 SvgSceneView 重畫
+  // 
+  // - scene 更新時，也同步更新 viewport
+  // ----------------------------------------------------------
+  private handleSceneUpdate(scene: SceneOutput) {
+    const ctrl = this.subscribedController ? this.subscribedController : this.props.controller;
+    const viewport = ctrl.getViewport();
+
+    // 同步 scene + viewport
+    // px/py 由 slider 的 setState + controller 更新來維持一致
+    this.setState({ scene, viewport });
+  }
+
+  // ----------------------------------------------------------
+  // handlePointDrag：SvgSceneView 拖曳事件回報入口
+  //
+  // - SvgSceneView 回報的是 (id, pixel)
+  // - GraphView 不解讀拖曳含義，只轉交給 controller
+  // - controller 決定要怎麼處理（例如回推 a、重算 scene、通知 view）
+  // ----------------------------------------------------------
+  private handlePointDrag(id: string, pixel: { x: number; y: number }) {
+    // Debug
+    // console.log("[GraphView] onPointDrag", id, pixel);
+
+    this.props.controller.onPointDrag(id, pixel);
+  }
+
+  // ----------------------------------------------------------
+  // handleTextDrag: 方程式標籤拖曳
+  // ----------------------------------------------------------
+  private handleTextDrag(id: string, pixel: { x: number; y: number }) {
+    this.props.controller.onTextDrag(id, pixel);
+  }
+
+
+
+  // // ----------------------------------------------------------
+  // // UI：ticks 下拉選單
+  // // - 只允許 ALLOWED_TICKS 內的值
+  // // ----------------------------------------------------------
+  // private handleOnTicksChange(e: React.ChangeEvent<HTMLSelectElement>) {
+  //   const raw = Number(e.currentTarget.value);
+
+  //   // 防呆: 確保一定是允許值
+  //   let allowedTicksValue = false;
+  //   let i = 0;
+  //   while (i < ALLOWED_TICKS.length) {
+  //     if (ALLOWED_TICKS[i] === raw) {
+  //       allowedTicksValue = true;
+  //     }
+  //     i++;
+  //   }
+
+  //   if (allowedTicksValue) {
+  //     this.setState({ ticks: raw });
+  //   }
+  // }
+
+  // // ----------------------------------------------------------
+  // // UI：控制刻度短線
+  // // ----------------------------------------------------------
+  // private handleOnShowTickLinesChange(e: React.ChangeEvent<HTMLInputElement>) {
+  //   this.setState({ showTickLines: e.currentTarget.checked });
+  // }
+
+  // // ----------------------------------------------------------
+  // // UI：控制刻度文字
+  // // ----------------------------------------------------------
+  // private handleOnShowTickLabelsChange(e: React.ChangeEvent<HTMLInputElement>) {
+  //   this.setState({ showTickLabels: e.target.checked });
+  // }
+
+
+  // =========================================================
+  // 匯出 SVG（LaTeX 可用）讓 AppView 用 ref 呼叫匯出
+  //
+  // 做法：
+  // 1) clone 一份 svg DOM（不要直接改畫面那份）
+  // 2) 加 xmlns / viewBox（讓外部工具更穩）
+  // 3) 用 XMLSerializer -> Blob -> <a downSload> 下載
+  // =========================================================
+  public exportSvg(fileNameRaw: string) {
+    // 先取得畫面上的 <svg>
+    const svg = this.svgRef.current;
+    if (!svg) {
+      return
+    }
+
+    let fileName = fileNameRaw.trim();
+    if (fileName.length === 0) {
+      fileName = "figure.svg";
+    }
+
+    // 確保附檔名
+    const lower = fileName.toLowerCase();
+    if(!lower.endsWith(".svg")) {
+      fileName = fileName + ".svg";
+    }
+
+    const svgCloned = svg.cloneNode(true) as SVGSVGElement;  // 避免直接影響原 <svg> 元素
+    
+    // 加上 xmlns (SVG 標準)
+    //  - 有些工具看到 XML (SVG 本質上是一種 XML)，如果沒有 xmlns，可能解析會失敗
+    svgCloned.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+
+    // 加上 viewBox: 讓 LaText / Inkscape 縮放更穩，避免切掉、跑位
+    svgCloned.setAttribute("viewBox",  `0 0 ${this.svgWidth} ${this.svgHeight}`);
+
+    // 匯出時拿掉 border (避免文件有醜框)
+    // 並且明確指定 color (因為許多 stroke 使用 currentColor)
+    svgCloned.setAttribute("style", "color: black;");
+
+    const serializer = new XMLSerializer();
+    const source = serializer.serializeToString(svgCloned);
+    const withHeader = `<?xml version="1.0" encoding="UTF-8"?>\n${source}`;
+
+    const blob = new Blob([withHeader], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+
+    // 清理 DOM 與 釋放暫時 URL (避免記憶體累積)
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+  }
+
+
+
+  // ----------------------------------------------------------
+  // render：把目前 state.scene 畫出來
+  // ----------------------------------------------------------
+  render() {
+    // 內容區尺寸（innerW/innerH）：
+    // - 用於座標軸長度、Viewport 寬高
+    // - 注意：這裡 GraphView 算 innerW/innerH，Controller 也要一致
+    //   否則拖曳 pixel<->econ 轉換會出現比例差
+    
+    // scene / viewport 都從 state 取 (確保一致)
+    const scene = this.state.scene;
+    const viewport = this.state.viewport;
+
+    // // 組合 tickVisibility 傳給 AxesView
+    // const tickVisibility = {
+    //   showTickLines: this.state.showTickLines,
+    //   showTickLabels: this.state.showTickLabels,
+    // }
+
+        
+    // --------------------------------------------------------
+    // 置中 offset 計算（關鍵）
+    //
+    // 可用內容區 = svgWidth/Height 扣掉 margin
+    // plot 區大小 = viewport.getInnerWidth/Height（由 controller 算出，會隨 px/py 改）
+    // offset = (avail - plot) / 2
+    //
+    // 這個 offset 必須同時用在：
+    // - AxesView translate
+    // - SvgSceneView 的 <g> translate
+    // 否則軸與圖形會錯位
+    // --------------------------------------------------------
+    // 扣掉 margin 後，真正能畫 plot 的空間
+    const innerWAvail = this.svgWidth - this.svgMargin.left - this.svgMargin.right;
+    const innerHAvail = this.svgHeight - this.svgMargin.top - this.svgMargin.bottom;
+
+    // plot 的實際尺寸由 controller 決定 (會隨 px/py 改變)
+    const plotW = viewport.getInnerWidth();
+    const plotH = viewport.getInnerHeight();
+
+    let offsetX = (innerWAvail - plotW) / 2;
+    let offsetY = (innerHAvail - plotH) / 2;
+
+    // 防呆機制: 不允許 offset < 0 (理論上不會，因為 controller 已經控制 plot <= avail)
+    if (offsetX < 0) {
+      offsetX = 0;
+    }
+    if (offsetY < 0) {
+      offsetY = 0;
+    }
+
+    return (
+      // SVG 外框：畫布容器
+      <svg
+        ref={this.svgRef}
+        width={this.svgWidth}
+        height={this.svgHeight}
+        style={{ border: "1px solid #ddd" }}
+      >
+        {/* ✅ 圖表標題（期刊圖常見：圖內上方置中） */}
+        <text
+          x={this.svgWidth / 2}
+          y={14}
+          fontSize={14}
+          textAnchor="middle"
+          fill="currentColor"
+        >
+          {this.props.chartTitle}
+        </text>
+        
+        {/* AxesView 自己會 translate(margin.left, margin.top) */}
+        <AxesView
+          viewport={viewport}
+          margin={this.svgMargin}
+          offset={{ x: offsetX, y: offsetY }}
+          ticks={this.props.ticks}
+          tickVisibility={this.props.tickVisibility}
+          xLabel={this.props.xLabel}
+          yLabel={this.props.yLabel}
+        />
+        {/* 內容區的群組 <g>：把「畫圖原點 (0,0)」從整張 SVG 的左上角，搬到內容區的左上角 */}
+        <g transform={`translate(${this.svgMargin.left + offsetX},${this.svgMargin.top + offsetY})`}>
+          {/* SvgSceneView：吃 scene.drawables 畫出 budget/indiff/opt/text
+              同時把拖曳事件回報給 GraphView */}
+          <SvgSceneView
+            scene={scene}  // Parent Component => Child Component
+            onPointDrag={this.handlePointDrag}  // Child Component => Parent Component
+            onTextDrag={this.handleTextDrag}
+          />
+        </g>
+      </svg>
+    );
+  }
+}
+"
+12. SvgSceneView.tsx: "// src/mvc/view/SvgSceneView.tsx
+
+// ------------------------------------------------------------
+// SvgSceneView（View/Renderer）
+// 任務：
+// 1) 把 scene.drawables 轉成真正的 SVG 元素（line/polyline/circle/text）
+// 2) 處理「互動」：pointer down/move/up/cancel
+//    - 命中（hit-test）point drawable
+//    - 若命中，開始拖曳
+//    - 拖曳過程回報給上層（GraphView -> Controller）
+//
+// 注意：
+// - SvgSceneView 不做經濟計算
+// - SvgSceneView 不知道 Viewport / domain
+// - 它只知道：我拿到「像素座標的 drawables」，我要畫出來並提供拖曳事件
+// ------------------------------------------------------------
+
+import React from "react";
+
+// Drawable/SceneOutput 是 renderer 的核心輸入規格
+// - Drawable：每個圖元（line/polyline/point/text）
+// - SceneOutput：包含 drawables + width/height + domain（domain通常不在 renderer 用）
+// SvgSceneView 只用 drawables 來畫
+import type { Drawable, SceneOutput } from "../../core/drawables";
+
+// ------------------------------------------------------------
+// Props：SvgSceneView 的輸入
+// - scene：當前場景（像素座標版的 drawables）
+// - onPointDrag：拖曳時回報（id + pixel 座標）
+//   - 這是「往上層的 callback」，SvgSceneView 不做狀態回推
+// ------------------------------------------------------------
+type Props = {
+  scene: SceneOutput;
+  onPointDrag?: (id: string, pixel: { x: number; y: number }) => void;
+  onTextDrag?: (id: string, pixel: { x: number; y: number }) => void;
+};
+
+// // ------------------------------------------------------------
+// // 小工具：exhaustiveness check
+// // 目的：如果你未來在 Drawable union type 新增一種 kind（例如 "rect"）
+// // 但忘記在 renderer 裡處理，TypeScript 會在這裡報錯提醒你補齊。
+// // ------------------------------------------------------------
+// function assertNever(x: never): never {
+//   // 這個 throw 理論上不會被執行（因為 x 是 never 表示不可能發生）
+//   throw new Error("Unhandled drawable kind: " + String(x));
+// }
+
+// ------------------------------------------------------------
+// class component 版本（OOP）
+// extends React.Component<Props> 表示：只用 props，不用 state
+// （拖曳狀態用 class fields 存，不放 state，避免 move 時狂 re-render）
+// ------------------------------------------------------------
+export class SvgSceneView extends React.Component<Props> {
+
+  // ----------------------------------------------------------
+  // gRef：指向 <g> DOM 元素，讓我們能取 getBoundingClientRect()
+  //
+  // ✅ 重要：ref 的 current 在 React 裡「初始化一定是 null」
+  // 所以正確型別應該允許 null：SVGGElement | null
+  //
+  // 你這裡宣告是 RefObject<SVGGElement | null>，
+  // 但 createRef<SVGGElement>() 回傳的其實是 RefObject<SVGGElement>
+  //（current: SVGGElement | null）
+  //
+  // 因此建議你用最標準寫法：
+  //   private gRef: React.RefObject<SVGGElement>;
+  // 這樣就不會出現你之前的 ts(2322) 型別衝突。
+  // ----------------------------------------------------------
+  private gRef: React.RefObject<SVGGElement | null>;
+
+  // draggingId：目前正在拖曳的 point drawable id（例如 "opt"）
+  private draggingId: string | null;
+  private draggingKind: "point" | "text" | null;
+
+  // pointerId：Pointer Events 裡用來辨識是哪一個 pointer 在拖曳
+  // 目的：避免多指/多點觸控時互相干擾
+  private pointerId: number | null;
+
+  // 保存每個 text 的 DOM node (用來做 getBBox hit-test)
+  // key = drawable.id，value = <text> 的 SVGTextElement
+  private textNodeById: Record<string, SVGTextElement | null>;
+
+
+  constructor(props: Props) {
+    super(props);
+
+    // --------------------------------------------------------
+    // createRef：建立一個 ref container
+    // current 在掛載前是 null，掛載後才會被 React 填入 DOM
+    //
+    // 型別建議：
+    //   this.gRef = React.createRef<SVGGElement>();
+    // 然後 gRef 的欄位宣告用 RefObject<SVGGElement>
+    // （因為它本來就允許 current 為 null）
+    // --------------------------------------------------------
+    this.gRef = React.createRef<SVGGElement>();
+
+    // 初始化拖曳狀態：尚未拖任何點
+    this.draggingId = null; // 你正在拖哪一個點（例如 "opt"）
+    this.pointerId = null;  // Pointer Events 的識別碼
+    this.draggingKind = null;
+
+    this.textNodeById = {};
+
+    // --------------------------------------------------------
+    // bind：class component 必備
+    // 因為 onPointerDown={this.handlePointerDown} 會把方法當 callback 傳走
+    // 若不 bind，this 可能 undefined
+    // --------------------------------------------------------
+    this.handlePointerDown = this.handlePointerDown.bind(this);
+    this.handlePointerMove = this.handlePointerMove.bind(this);
+    this.handlePointerUp = this.handlePointerUp.bind(this);
+    this.handlePointerCancel = this.handlePointerCancel.bind(this);
+  }
+
+
+  
+  // ------------------------------------------------------------
+  // 小工具：exhaustiveness check
+  // 目的：如果你未來在 Drawable union type 新增一種 kind（例如 "rect"）
+  // 但忘記在 renderer 裡處理，TypeScript 會在這裡報錯提醒你補齊。
+  // ------------------------------------------------------------
+  private assertNever(x: never): never {
+    // 這個 throw 理論上不會被執行（因為 x 是 never 表示不可能發生）
+    throw new Error("Unhandled drawable kind: " + String(x));
+  }
+
+
+  // ----------------------------------------------------------
+  // getLocalPoint：
+  // 把滑鼠/手指事件 e.clientX/e.clientY（視窗座標）
+  // 轉成 <g> 群組內的「局部像素座標」
+  // 
+  // 原理：
+  // - getBoundingClientRect() 取得 <g> 在螢幕上的左上角（rect.left, rect.top）
+  // - 用 clientX - rect.left，得到點擊位置相對於 <g> 左上角的偏移
+  // ----------------------------------------------------------
+  private getLocalPoint(e: React.PointerEvent<SVGGElement>) {
+    const g = this.gRef.current;
+
+    // 防呆：ref 還沒掛載時 current 可能是 null
+    if (!g) {
+      return { x: 0, y: 0 };
+    }
+
+    const svg = g.ownerSVGElement;
+    if (!svg) {
+      return { x: 0, y: 0 };
+    }
+
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+
+    const ctm = g.getScreenCTM();
+    if (!ctm) {
+      return { x: 0, y: 0 };
+    }
+
+    const local = pt.matrixTransform(ctm.inverse());
+
+    // 把回傳前的純量命名成 xPixel / yPixel (局部像素座標)
+    const xPixel = local.x;
+    const yPixel = local.y;
+    return { x: xPixel, y: yPixel };
+  }
+
+  // ----------------------------------------------------------
+  // findHitPointId（hit-test）：
+  // 給定 local(x,y)，找出「最接近且命中的 point drawable」
+  //
+  // 你目前的規則：
+  // - 只對 kind === "point" 的 drawable 做命中
+  // - 計算距離平方 d2（避免 sqrt）
+  // - 容錯半徑 tol = 6，實際命中半徑 = d.r + tol
+  // - 若同時命中多點，取距離最小者
+  // ----------------------------------------------------------
+  private findHitPointId(local: { x: number; y: number }) {
+
+    // Debug
+    // const points = this.props.scene.drawables.filter((d) => d.kind === "point");
+    // console.log("[HIT] point drawables:", points.map((p) => ({ id: p.id, c: p.center, r: p.r })));
+
+
+    const drawables = this.props.scene.drawables;
+
+    let bestId: string | null = null;
+    let bestD2 = Number.POSITIVE_INFINITY;
+
+    // 將 local 的 x/y 明確命名成像素座標純量
+    const xPixel = local.x;
+    const yPixel = local.y;
+
+    let i = 0;
+    while (i < drawables.length) {
+      const d = drawables[i];
+
+      if (d.kind === "point") {  // 因為每一個 drawable 物件有多的 kind，這邊只取出 point(點) 相關的
+        // local 與點中心差
+        const dx = xPixel - d.center.x;
+        const dy = yPixel - d.center.y;
+
+        // 距離平方
+        const d2 = dx * dx + dy * dy;
+
+        // Debug
+        // if (d.id === "opt") {
+        //   console.log("[HIT-DBG] local=", local, "center=", d.center, "dx=", dx, "dy=", dy, "d2=", d2, "r=", d.r);
+        // }
+
+        // 命中半徑 = 原本半徑 + 容錯
+        const tol = 24;  // tolerance
+        const r = d.r + tol;  // radius
+        const r2 = r * r;  // radius square
+
+        // 若在半徑內，視為命中
+        if (d2 <= r2) {
+          // 若同時命中多個點，取最近的一個
+          if (d2 < bestD2) {
+            bestD2 = d2;
+            bestId = d.id;
+          }
+        }
+      }
+
+      i++;
+    }
+
+    return bestId;
+  }
+
+  // ----------------------------------------------------------
+  // findHitDraggableTextId:
+  // 命中 draggable text（拖方程式標籤）
+  //
+  // 因為 SVG text 很難精準量 bbox（除非去抓 DOM measurement），
+  // 這裡用「簡化版」的 hit box：
+  // - 估算寬度 = text.length * fontSize * 0.6
+  // - 高度 = fontSize
+  // - 再加 padding
+  // ----------------------------------------------------------
+  private findHitDraggableTextId(local: { x: number; y: number }) {
+    const drawables = this.props.scene.drawables;
+
+    const x = local.x;
+    const y = local.y;
+
+    let bestId: string | null = null;
+    let bestD2 = Number.POSITIVE_INFINITY;
+    
+    let i = 0;
+    while (i < drawables.length) {
+      const d = drawables[i];
+
+      if (d.kind === "text" && d.draggable) {
+        // const fontSize = d.fontSize ? d.fontSize : 12;
+        // const approxW = d.text.length * fontSize * 0.6;
+        // const approxH = fontSize;
+
+        // const pad = 10;
+
+        // const left = d.pos.x - pad;
+        // const right = d.pos.x + approxW + pad;
+
+        // // 注意：SVG text 的 y 是 baseline，所以 bbox 往上算 fontSize
+        // const top = d.pos.y - approxH - pad;
+        // const bottom = d.pos.y + pad;
+
+        // const inside = x >= left && x <= right && y >= top && y <= bottom;
+        // if (inside) {
+        //   const cx = d.pos.x + approxW / 2;
+        //   const cy = d.pos.y - approxH / 2;
+        //   const dx = x - cx;
+        //   const dy = y - cy;
+        //   const d2 = dx * dx + dy * dy;
+
+        //   if (d2 < bestD2) {
+        //     bestD2 = d2;
+        //     bestId = d.id;
+        //   }
+        // }
+
+        const node = this.textNodeById[d.id];
+
+        // 預設使用 bbox hit-test；若 node 不存在才 fallback
+        let usedBBox = false;
+
+        if (node) {
+          // getBBox 回傳的是「在目前 SVG 坐標系下」的真實 bounding box
+          // 若元素 display:none 可能拿不到 bbox
+          const bbox = node.getBBox();
+
+          const padding = 6;  // 多給一點 padding 使用者體驗較佳
+          const left = bbox.x - padding;
+          const right = bbox.x + bbox.width + padding;
+          const top = bbox.y - padding;
+          const bottom = bbox.y + bbox.height + padding;
+
+          const inside = (x >= left) && (x <= right) && (y >= top) && (y <= bottom);
+          if (inside) {
+            const cx = bbox.x + bbox.width / 2;
+            const cy = bbox.y + bbox.height / 2;
+            const dx = x - cx;
+            const dy = y - cy;
+            const d2 = dx * dx + dy * dy;
+
+            if (d2 < bestD2) {
+              bestD2 = d2;
+              bestId = d.id;
+            }
+          }
+
+          usedBBox = true;
+        }
+
+        // fallback: 萬一 node 尚未建立，才使用近似法
+        if (!usedBBox) {
+          const fontSize = d.fontSize ? d.fontSize : 12;
+          const approxW = d.text.length * fontSize * 0.6;
+          const approxH = fontSize;
+
+          const padding = 10;
+          const left = d.pos.x - padding;
+          const right = d.pos.x + approxW + padding;
+          const top = d.pos.y - approxH - padding;
+          const bottom = d.pos.y + padding;
+
+          const inside = (x >= left) && (x <= right) && (y >= top) && (y <= bottom);
+          if (inside) {
+            const cx = d.pos.x + approxW / 2;
+            const cy = d.pos.y - approxH / 2;
+            const dx = x - cx;
+            const dy = y - cy;
+            const d2 = dx * dx + dy * dy;
+
+            if (d2 < bestD2) {
+              bestD2 = d2;
+              bestId = d.id;
+            }
+          }
+        }
+      }
+
+      i += 1;
+    }
+
+    return bestId;
+  }
+
+
+
+  // ----------------------------------------------------------
+  // handlePointerDown：
+  // - 取得 local 座標
+  // - hit-test 找命中的 point id
+  // - 若命中：開始拖曳
+  //   - 記錄 draggingId / pointerId
+  //   - setPointerCapture：讓後續 move/up 即使移出元素也能收到事件
+  //   - preventDefault：避免瀏覽器原生行為（選字、拖曳、捲動）
+  // ----------------------------------------------------------
+  private handlePointerDown(e: React.PointerEvent<SVGGElement>) {
+    const coordinatePixel = this.getLocalPoint(e);
+
+    // 先試圖命中 draggable text (通常文字更需要優先被點到)
+    const hitTextId = this.findHitDraggableTextId(coordinatePixel);
+    if (hitTextId) {
+      this.draggingId = hitTextId;
+      this.draggingKind = "text";
+      this.pointerId = e.pointerId;
+
+      e.currentTarget.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    }
+
+    // 再命中 point
+    const hitPointId = this.findHitPointId(coordinatePixel);
+    if (hitPointId) {
+      this.draggingId = hitPointId;  // 記錄正在拖的 id（draggingId）
+      this.draggingKind = "point";
+      this.pointerId = e.pointerId;  // 記錄正在拖的 id（draggingId），可能存在多工操作
+
+      // 捕捉 pointer：確保 move/up 事件都送到這個元素
+      e.currentTarget.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      return;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // handlePointerMove：
+  // - 若沒有 draggingId：表示目前沒有在拖，直接 return
+  // - 若 pointerId 不匹配：忽略（避免多指干擾）
+  // - 取得 local 座標
+  // - 若有 onPointDrag callback：回報 (draggingId, local)
+  //
+  // 重要：這裡不 setState，因為 move 會非常頻繁
+  // 真正要更新圖形，交給上層 Controller -> rebuild -> notify -> GraphView setState
+  // ----------------------------------------------------------
+  private handlePointerMove(e: React.PointerEvent<SVGGElement>) {
+    const draggingId = this.draggingId;
+    const draggingKind = this.draggingKind;
+
+    if (!draggingId || !draggingKind) {
+      return;
+    }
+
+    // Debug
+    // console.log("[MOVE] draggingId=", draggingId);
+
+    if (this.pointerId !== e.pointerId) {
+      return;
+    }
+
+    const coordinatePixel = this.getLocalPoint(e);
+
+    if (draggingKind === "point") {
+      const cb = this.props.onPointDrag;
+      if (cb) {
+        cb(draggingId, coordinatePixel);
+      }
+    }
+
+    if (draggingKind === "text") {
+      const cb = this.props.onTextDrag;
+      if (cb) {
+        cb(draggingId, coordinatePixel);
+      }
+    }
+    // SvgSceneView：只回報拖曳
+    // Controller：算新 scene + notify
+    // GraphView：setState(scene) 觸發重畫
+
+    e.preventDefault();
+  }
+
+  // ----------------------------------------------------------
+  // endDrag：
+  // 清空拖曳狀態（結束拖曳）
+  // ----------------------------------------------------------
+  private endDrag() {
+    this.draggingId = null;
+    this.draggingKind = null;
+    this.pointerId = null;
+  }
+
+  // ----------------------------------------------------------
+  // handlePointerUp / handlePointerCancel：
+  // - 若是同一個 pointer 結束，就 endDrag()
+  // cancel：例如系統中斷、手勢被瀏覽器接管等情況
+  // ----------------------------------------------------------
+  private handlePointerUp(e: React.PointerEvent<SVGGElement>) {
+    if (this.pointerId === e.pointerId) {
+      this.endDrag();
+    }
+  }
+
+  private handlePointerCancel(e: React.PointerEvent<SVGGElement>) {
+    if (this.pointerId === e.pointerId) {
+      this.endDrag();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // render：
+  // - 輸出 <g> 群組
+  // - 綁定 pointer handlers
+  // - 用 scene.drawables.map(...) 逐個轉成 SVG 元素
+  //
+  // style={{ touchAction: "none" }}
+  // - 重要：避免觸控時被瀏覽器預設行為（例如捲動、縮放）搶走事件
+  // ----------------------------------------------------------
+  render() {
+    const scene = this.props.scene;
+
+    return (
+      <g
+        ref={this.gRef} // 把 ref 掛上，React 會把 <g> DOM 填到 gRef.current
+        onPointerDown={this.handlePointerDown}
+        onPointerMove={this.handlePointerMove}
+        onPointerUp={this.handlePointerUp}
+        onPointerCancel={this.handlePointerCancel}
+        style={{ touchAction: "none" }}
+      >
+        {scene.drawables.map((d: Drawable) => {
+          // switch：明確處理每一種 drawable
+          // 好處：未來新增 kind 時，TS 會提醒你補 renderer（exhaustiveness check）
+          switch (d.kind) {
+            // -----------------------------
+            // case 1) line -> <line /> 
+            // -----------------------------
+            case "line": {
+              // 預設 stroke 顏色：currentColor（會跟 CSS 的文字顏色一致）
+              let strokeColor = "currentColor";
+
+              // strokeWidth / dashArray：可能不存在，所以用 undefined
+              let strokeWidth: number | undefined;
+              let dashArray: string | undefined;
+
+              // 若有 stroke 設定，就覆蓋預設
+              if (d.stroke) {
+                // 若有指定顏色，就使用指定顏色
+                if (d.stroke.color) {
+                  strokeColor = d.stroke.color;
+                }
+
+                // 若有指定寬度，就使用指定寬度
+                strokeWidth = d.stroke.width;
+
+                // 若有 dash（例如 [4,2]），轉成 "4 2" 給 SVG
+                if (d.stroke.dash) {
+                  dashArray = d.stroke.dash.join(" ");
+                }
+              }
+
+              // 回傳 SVG <line />
+              return (
+                <line
+                  key={d.id} // React list key（必須穩定）
+                  x1={d.a.x} // 起點 x
+                  y1={d.a.y} // 起點 y
+                  x2={d.b.x} // 終點 x
+                  y2={d.b.y} // 終點 y
+                  stroke={strokeColor} // 線顏色
+                  strokeWidth={strokeWidth} // 線寬（undefined 則用 SVG 預設 1）
+                  strokeDasharray={dashArray} // 虛線樣式（undefined 則實線）
+                />
+              );
+            }
+
+            // -----------------------------
+            // case 2) polyline -> <polyline />
+            // -----------------------------
+            case "polyline": {
+              // 預設 stroke 顏色
+              let strokeColor = "currentColor";
+
+              // 可能不存在的線寬與 dash
+              let strokeWidth: number | undefined;
+              let dashArray: string | undefined;
+
+              // 若有 stroke 設定就套用
+              if (d.stroke) {
+                if (d.stroke.color) {
+                  strokeColor = d.stroke.color;
+                }
+                strokeWidth = d.stroke.width;
+                if (d.stroke.dash) {
+                  dashArray = d.stroke.dash.join(" ");
+                }
+              }
+
+              // pointsAttr：polyline 需要 "x1,y1 x2,y2 x3,y3" 這種字串
+              // map：把每個點 p 變成 "x,y"
+              // join(" ")：用空白把每段 "x,y" 串起來
+              const pointsAttr = d.points.map((p) => `${p.x},${p.y}`).join(" ");
+
+              // 回傳 SVG <polyline />
+              return (
+                <polyline
+                  key={d.id} // React key
+                  points={pointsAttr} // 折線點字串
+                  fill="none" // 不填滿（只畫線）
+                  stroke={strokeColor} // 線顏色
+                  strokeWidth={strokeWidth} // 線寬
+                  strokeDasharray={dashArray} // 虛線
+                />
+              );
+            }
+
+            // -----------------------------
+            // case 3) point -> <circle />（我們用兩顆圈：大透明熱區 + 小顯示點）
+            // -----------------------------
+            case "point": {
+              // 預設 fill 顏色
+              let fillColor = "currentColor";
+
+              // 若有 fill.color，就使用它
+              if (d.fill && d.fill.color) {
+                fillColor = d.fill.color;
+              }
+
+              // 外框 stroke 可能不存在
+              let strokeColor: string | undefined;
+              let strokeWidth: number | undefined;
+              let dashArray: string | undefined;
+
+              // 若有 stroke，就套用
+              if (d.stroke) {
+                strokeColor = d.stroke.color;
+                strokeWidth = d.stroke.width;
+                if (d.stroke.dash) {
+                  dashArray = d.stroke.dash.join(" ");
+                }
+              }
+
+              // 做一個比較容易點到的「熱區半徑」
+              // - 至少 18
+              // - 或者 d.r + 14（點越小越需要放大熱區）
+              const hitRadius = Math.max(d.r + 14, 18);
+
+              // 回傳：用 <g> 包住兩個 circle
+              return (
+                <g key={d.id}>
+                  {/* 
+                    熱區圈：透明但會吃 pointer events
+                    為什麼需要？
+                    - 你的點通常很小（r=4）
+                    - 使用者很難「精準點中」
+                    - 所以加一顆透明大圈，讓 hit-test 更容易成功
+                  */}
+                  <circle
+                    cx={d.center.x} // 圓心 x
+                    cy={d.center.y} // 圓心 y
+                    r={hitRadius} // 大圈半徑
+                    fill="transparent" // 透明（看不到）
+                    style={{
+                      pointerEvents: "all", // 強制這顆圈接收事件
+                      cursor: "grab", // 滑鼠移上去顯示可拖曳
+                    }}
+                  />
+
+                  {/* 
+                    真正顯示的點：原本那顆小圈
+                    pointerEvents: "none" 的理由：
+                    - 避免小圈自己搶事件
+                    - 事件統一交給大圈（熱區）去接
+                    - 這樣點擊體驗穩定
+                  */}
+                  <circle
+                    cx={d.center.x} // 圓心 x
+                    cy={d.center.y} // 圓心 y
+                    r={d.r} // 真實點半徑（畫面大小）
+                    fill={fillColor} // 填色
+                    stroke={strokeColor} // 外框顏色（可選）
+                    strokeWidth={strokeWidth} // 外框寬（可選）
+                    strokeDasharray={dashArray} // 外框虛線（可選）
+                    style={{
+                      pointerEvents: "none", // 讓事件不要被這顆圈拿走
+                    }}
+                  />
+                </g>
+              );
+            }
+
+            // -----------------------------
+            // case 4) text -> <text />
+            // -----------------------------
+            case "text": {
+              // 文字顏色可指定；不指定就 currentColor
+              let fillColor = "currentColor";
+              if (d.fill && d.fill.color) {
+                fillColor = d.fill.color;
+              }
+              return (
+                <text
+                  key={d.id} // React key
+                  x={d.pos.x} // 文字位置 x
+                  y={d.pos.y} // 文字位置 y
+                  fontSize={d.fontSize} // 字體大小（可選）
+                  fill={fillColor} // 文字顏色
+
+                  ref = {(node) => {
+                    this.textNodeById[d.id] = node;
+                  }}
+
+
+                  style={{
+                    cursor: d.draggable ? "move" : "default",
+                    userSelect: "none",
+                  }}
+                >
+                  {d.text}
+                </text>
+              );
+            }
+
+            // -----------------------------
+            // default：理論上不會進來
+            // - 如果你新增了 Drawable kind 卻忘記補 case，TS 會在 assertNever 報錯提醒你
+            // -----------------------------
+            default: {
+              const _exhaustiveCheck: never = d;
+              return this.assertNever(_exhaustiveCheck);
+            }
+          }
+        })}
+      </g>
+    );
+  }
+}
+"
+13. index.css: "/* ------------------------------------------------------------
+   :root 代表整份文件的「根元素」(<html>)
+   這裡常用來放全站共用的「全域設定 / CSS 變數 / 字型」等。
+   ------------------------------------------------------------ */
+:root {
+  /* 全站預設字體家族（Apple 系統字體優先）
+     說明：
+     - -apple-system：Safari / iOS / macOS 的系統字體（San Francisco）
+     - BlinkMacSystemFont：Chrome 在 macOS 的系統字體入口
+     - "SF Pro Text" / "SF Pro Display"：Apple 字體家族（若存在則用）
+     - system-ui：各平台的系統 UI 字體 fallback（Windows 會落到 Segoe UI）
+     - 後面是通用 fallback
+  */
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    system-ui, "Helvetica Neue", Arial, sans-serif;
+
+  /* 行高：文字每一行的高度比例（1.5 倍） -> 可讀性較好 */
+  line-height: 1.5;
+
+  /* 預設字重：400 = normal */
+  font-weight: 400;
+
+  /* ----------------------------------------------------------
+     color-scheme：告訴瀏覽器這個網站支援 light / dark
+     好處：
+     - 表單控制項（input/scrollbar）能自動配合深淺色
+     注意：它不是直接「切換顏色」，只是告知瀏覽器支援。
+     ---------------------------------------------------------- */
+  color-scheme: light dark;
+
+  /* 預設文字顏色：rgba(255,255,255,0.87) 表示白色但稍微透明
+     在深色背景上比較柔和，不那麼刺眼 */
+  color: rgba(255, 255, 255, 0.87);
+
+  /* 預設背景色：深灰 */
+  background-color: #242424;
+
+  /* font-synthesis: none
+     這個設定會避免瀏覽器「自己合成」粗體/斜體（fake bold/italic）
+     有些字型沒有 bold/italic，瀏覽器會硬做，效果可能不好。
+  */
+  font-synthesis: none;
+
+  /* text-rendering: optimizeLegibility
+     告訴瀏覽器偏向「可讀性」的字形渲染策略（可能做 kerning 等微調）
+     在某些瀏覽器上文字會更順眼。
+  */
+  text-rendering: optimizeLegibility;
+
+  /* -webkit-font-smoothing / -moz-osx-font-smoothing
+     這兩個是平台相關的字體平滑設定：
+     - WebKit (Chrome/Safari) 的抗鋸齒優化
+     - macOS Firefox 的灰階平滑
+     讓文字看起來更細緻。
+  */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ------------------------------------------------------------
+   a：所有超連結 <a> 的預設樣式
+   ------------------------------------------------------------ */
+a {
+  /* 連結字重稍微加重（500）
+     讓連結比較醒目，但不會像 bold 那麼重 */
+  font-weight: 500;
+
+  /* 連結顏色（藍紫色系） */
+  color: #646cff;
+
+  /* text-decoration: inherit
+     讓 <a> 繼承父元素的 text-decoration（通常會讓底線不強制出現）
+     在很多 UI 設計中，連結常用顏色 + hover 表現，而不是一直有底線 */
+  text-decoration: inherit;
+}
+
+/* ------------------------------------------------------------
+   a:hover：滑鼠移到連結上時
+   ------------------------------------------------------------ */
+a:hover {
+  /* hover 時顏色變深一點，提供互動回饋 */
+  color: #535bf2;
+}
+
+/* ------------------------------------------------------------
+   body：整個頁面內容容器
+   Vite 模板常把 body 設成 flex 並置中，
+   讓首頁 demo 看起來像是「畫面中央有一張卡」。
+   ------------------------------------------------------------ */
+body {
+  /* 清掉瀏覽器預設 margin（很多瀏覽器 body 預設有 8px margin） */
+  margin: 0;
+
+  /* display:flex：把 body 變成 flex 容器 */
+  display: flex;
+
+  /* place-items: center
+     這是 CSS Grid 常用，但在 Flex 上也會被部分瀏覽器支援（實務上可用）
+     等價概念：align-items: center;
+     目的：在交叉軸置中（垂直置中）
+  */
+  place-items: center;
+
+  /* min-width: 320px：最小寬度限制（避免太窄排版崩）
+     320px 是手機常見最小寬度基準 */
+  min-width: 320px;
+
+  /* min-height: 100vh：最小高度 = 1 個視窗高度
+     目的：讓置中效果在整個視窗高度內成立 */
+  min-height: 100vh;
+}
+
+/* ------------------------------------------------------------
+   h1：大標題
+   Vite template 的 demo 常用 h1 當主標題
+   ------------------------------------------------------------ */
+h1 {
+  /* 3.2em：相對於目前字體大小的 3.2 倍 */
+  font-size: 3.2em;
+
+  /* line-height: 1.1：標題行高較小，讓大字看起來更緊湊 */
+  line-height: 1.1;
+}
+
+/* ------------------------------------------------------------
+   button：按鈕的統一樣式（Vite demo 那顆按鈕）
+   ------------------------------------------------------------ */
+button {
+  /* 圓角 */
+  border-radius: 8px;
+
+  /* 先給透明邊框，避免 hover 時加邊框造成按鈕尺寸跳動 */
+  border: 1px solid transparent;
+
+  /* padding：上下 0.6em、左右 1.2em
+     em 會跟著字體大小變動 -> 更一致的比例 */
+  padding: 0.6em 1.2em;
+
+  /* 字體大小 1em：跟父層一致 */
+  font-size: 1em;
+
+  /* 字重稍加重 */
+  font-weight: 500;
+
+  /* font-family: inherit：繼承全站字體（:root 的設定） */
+  font-family: inherit;
+
+  /* 深色背景：按鈕本體底色 */
+  background-color: #1a1a1a;
+
+  /* cursor: pointer：滑鼠移上去顯示手指 -> 表示可點擊 */
+  cursor: pointer;
+
+  /* transition：讓 border-color 的變化更平滑（0.25 秒） */
+  transition: border-color 0.25s;
+}
+
+/* button:hover：hover 時顯示邊框顏色（互動回饋） */
+button:hover {
+  border-color: #646cff;
+}
+
+/* ------------------------------------------------------------
+   button:focus / button:focus-visible
+   - focus：鍵盤 tab 移到按鈕上
+   - focus-visible：瀏覽器判斷「真的需要顯示焦點」的情境（通常鍵盤操作）
+   這是可及性（accessibility）的關鍵
+   ------------------------------------------------------------ */
+button:focus,
+button:focus-visible {
+  /* outline：焦點外框，使用系統預設的 focus-ring 顏色 */
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+/* ------------------------------------------------------------
+   @media (prefers-color-scheme: light)
+   這是「使用者系統偏好淺色模式」時套用的樣式
+   - 若系統是 Light Mode，會套用下面的覆蓋設定
+   - 若系統是 Dark Mode，就用上面 :root 的深色設定
+   ------------------------------------------------------------ */
+@media (prefers-color-scheme: light) {
+  :root {
+    /* 淺色模式的文字顏色：深灰藍 */
+    color: #213547;
+
+    /* 淺色模式的背景：白色 */
+    background-color: #ffffff;
+  }
+
+  a:hover {
+    /* 淺色模式 hover 的連結顏色略不同 */
+    color: #747bff;
+  }
+
+  button {
+    /* 淺色模式按鈕底色改成淺灰 */
+    background-color: #f9f9f9;
+  }
+}
+"
+14. main.tsx: "import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import "./index.css";
+import AppView from "./app/AppView";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <AppView />
+  </StrictMode>
+);
+"

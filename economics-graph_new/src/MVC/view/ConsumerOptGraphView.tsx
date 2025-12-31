@@ -16,9 +16,9 @@
 
 import React from "react";
 
-// Margin 型別：{top,right,bottom,left}
-// margin 用於內容區偏移（座標軸、繪圖區留白）
-import type { Margin } from "../../core/types";
+// // Margin 型別：{top,right,bottom,left}
+// // margin 用於內容區偏移（座標軸、繪圖區留白）
+// import type { Margin } from "../../core/types";
 
 // AxesView：專門畫座標軸（只畫，不算）
 import { AxesView } from "./AxesView";
@@ -36,11 +36,14 @@ import { ConsumerOptController } from "../controller/ConsumerOptController";
 // GraphView: GraphView 的 state 也保存 viewport
 import { Viewport } from "../../core/Viewport";
 
+import type { TickVisibility } from "./axesTicks";
 
-// ------------------------------------------------------------
-// ALLOWED_TICKS: 限制 ticks 值: 避免奇怪數字 (1, 2, 4, 5, 10)
-// ------------------------------------------------------------
-const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10]; 
+import { SVG_HEIGHT, SVG_MARGIN, SVG_WIDTH } from "../../core/layout";
+
+// // ------------------------------------------------------------
+// // ALLOWED_TICKS: 限制 ticks 值: 避免奇怪數字 (1, 2, 4, 5, 10)
+// // ------------------------------------------------------------
+// const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10]; 
 
 // ------------------------------------------------------------
 // Props：外部（通常是 AppView）必須傳入 controller
@@ -48,6 +51,21 @@ const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10];
 // ------------------------------------------------------------
 type Props = {
   controller: ConsumerOptController;
+
+  ticks: number;
+  tickVisibility: TickVisibility;
+
+  xLabel: string;
+  yLabel: string;
+
+  // 是否顯示 axis labels
+  showXLabel: boolean;
+  showYLabel: boolean;
+
+  // 新增: 標題顯示與自體
+  chartTitle: string;
+  showChartTitle: boolean;
+  chartTitleFontSize: number;
 };
 
 // ------------------------------------------------------------
@@ -60,9 +78,9 @@ type State = {
   scene: SceneOutput;
   viewport: Viewport;
 
-  ticks: number;
-  showTickLines: boolean;
-  showTickLabels: boolean;
+  // ticks: number;
+  // showTickLines: boolean;
+  // showTickLabels: boolean;
 };
 
 // ------------------------------------------------------------
@@ -81,7 +99,9 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
   // ----------------------------------------------------------
   private readonly svgWidth: number;
   private readonly svgHeight: number;
-  private readonly svgMargin: Margin;
+
+  // private readonly svgMargin: Margin;
+  private readonly svgMargin = SVG_MARGIN;
 
   private subscribedController: ConsumerOptController | null;
 
@@ -95,8 +115,8 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     super(props); // 必須呼叫 super(props)，讓 React 初始化 Component
 
     // SVG 外框尺寸（整張畫布）
-    this.svgWidth = 520;
-    this.svgHeight = 360;
+    this.svgWidth = SVG_WIDTH;
+    this.svgHeight = SVG_HEIGHT;
 
     // 留白：讓座標軸 / 標籤可以放得下
     // 內容區（inner）就是扣掉 margin 後的範圍，中間那塊「真正拿來畫圖的區域」
@@ -107,6 +127,9 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     //  - 下方要放 X 軸的數字，不留白會被切掉
     this.svgMargin = { top: 20, right: 20, bottom: 30, left: 40 };
 
+    // svg ref: 拿到真正的 <svg> DOM 節點
+    this.svgRef = React.createRef<SVGSVGElement>();
+
     // --------------------------------------------------------
     // 初始化 state.scene
     // - props.controller.getScene()：向 controller 取得「目前最新」scene
@@ -115,12 +138,13 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     // --------------------------------------------------------
     const scene = props.controller.getScene();
     const viewport = props.controller.getViewport();
+
     this.state = { 
       scene, 
       viewport,
-      ticks: 5,
-      showTickLines: true,
-      showTickLabels: true,
+      // ticks: 5,
+      // showTickLines: true,
+      // showTickLabels: true,
     };
 
     // --------------------------------------------------------
@@ -135,15 +159,16 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     this.handlePointDrag = this.handlePointDrag.bind(this);
 
     // bind Tick handlers
-    this.handleOnTicksChange = this.handleOnTicksChange.bind(this);
-    this.handleOnShowTickLinesChange = this.handleOnShowTickLinesChange.bind(this);
-    this.handleOnShowTickLabelsChange = this.handleOnShowTickLabelsChange.bind(this);
+    // this.handleOnTicksChange = this.handleOnTicksChange.bind(this);
+    // this.handleOnShowTickLinesChange = this.handleOnShowTickLinesChange.bind(this);
+    // this.handleOnShowTickLabelsChange = this.handleOnShowTickLabelsChange.bind(this);
 
-    // 匯出 SVG handler
-    this.handleExportSvg = this.handleExportSvg.bind(this);
+    // 文字拖曳
+    this.handleTextDrag = this.handleTextDrag.bind(this);
 
-    // svg ref: 拿到真正的 <svg> DOM 節點
-    this.svgRef = React.createRef<SVGSVGElement>();
+
+    // // 匯出 SVG handler
+    // this.handleExportSvg = this.handleExportSvg.bind(this);
 
     // --------------------------------------------------------
     // 訂閱 controller：這就是你前面問的「訂閱者」！
@@ -212,9 +237,16 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
   // - scene 更新時，也同步更新 viewport
   // ----------------------------------------------------------
   private handleSceneUpdate(scene: SceneOutput) {
-    const ctrl = this.subscribedController ? this.subscribedController : this.props.controller;
+    // const ctrl = this.subscribedController ? this.subscribedController : this.props.controller;
+    let ctrl = this.props.controller;
+    if (this.subscribedController) {
+      ctrl = this.subscribedController;
+    }
+
     const viewport = ctrl.getViewport();
 
+    // 同步 scene + viewport
+    // px/py 由 slider 的 setState + controller 更新來維持一致
     this.setState({ scene, viewport });
   }
 
@@ -232,59 +264,77 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     this.props.controller.onPointDrag(id, pixel);
   }
 
-
   // ----------------------------------------------------------
-  // UI：ticks 下拉選單
-  // - 只允許 ALLOWED_TICKS 內的值
+  // handleTextDrag: 方程式標籤拖曳
   // ----------------------------------------------------------
-  private handleOnTicksChange(e: React.ChangeEvent<HTMLSelectElement>) {
-    const raw = Number(e.currentTarget.value);
-
-    // 防呆: 確保一定是允許值
-    let allowedTicksValue = false;
-    let i = 0;
-    while (i < ALLOWED_TICKS.length) {
-      if (ALLOWED_TICKS[i] === raw) {
-        allowedTicksValue = true;
-      }
-      i++;
-    }
-
-    if (allowedTicksValue) {
-      this.setState({ ticks: raw });
-    }
+  private handleTextDrag(id: string, pixel: { x: number; y: number }) {
+    this.props.controller.onTextDrag(id, pixel);
   }
 
-  // ----------------------------------------------------------
-  // UI：控制刻度短線
-  // ----------------------------------------------------------
-  private handleOnShowTickLinesChange(e: React.ChangeEvent<HTMLInputElement>) {
-    this.setState({ showTickLines: e.currentTarget.checked });
-  }
 
-  // ----------------------------------------------------------
-  // UI：控制刻度文字
-  // ----------------------------------------------------------
-  private handleOnShowTickLabelsChange(e: React.ChangeEvent<HTMLInputElement>) {
-    this.setState({ showTickLabels: e.target.checked });
-  }
+
+  // // ----------------------------------------------------------
+  // // UI：ticks 下拉選單
+  // // - 只允許 ALLOWED_TICKS 內的值
+  // // ----------------------------------------------------------
+  // private handleOnTicksChange(e: React.ChangeEvent<HTMLSelectElement>) {
+  //   const raw = Number(e.currentTarget.value);
+
+  //   // 防呆: 確保一定是允許值
+  //   let allowedTicksValue = false;
+  //   let i = 0;
+  //   while (i < ALLOWED_TICKS.length) {
+  //     if (ALLOWED_TICKS[i] === raw) {
+  //       allowedTicksValue = true;
+  //     }
+  //     i++;
+  //   }
+
+  //   if (allowedTicksValue) {
+  //     this.setState({ ticks: raw });
+  //   }
+  // }
+
+  // // ----------------------------------------------------------
+  // // UI：控制刻度短線
+  // // ----------------------------------------------------------
+  // private handleOnShowTickLinesChange(e: React.ChangeEvent<HTMLInputElement>) {
+  //   this.setState({ showTickLines: e.currentTarget.checked });
+  // }
+
+  // // ----------------------------------------------------------
+  // // UI：控制刻度文字
+  // // ----------------------------------------------------------
+  // private handleOnShowTickLabelsChange(e: React.ChangeEvent<HTMLInputElement>) {
+  //   this.setState({ showTickLabels: e.target.checked });
+  // }
 
 
   // =========================================================
-  // 匯出 SVG（LaTeX 可用）
+  // 匯出 SVG（LaTeX 可用）讓 AppView 用 ref 呼叫匯出
   //
   // 做法：
   // 1) clone 一份 svg DOM（不要直接改畫面那份）
   // 2) 加 xmlns / viewBox（讓外部工具更穩）
-  // 3) 用 XMLSerializer -> Blob -> <a download> 下載
+  // 3) 用 XMLSerializer -> Blob -> <a downSload> 下載
   // =========================================================
-  private handleExportSvg() {
+  public exportSvg(fileNameRaw: string) {
     // 先取得畫面上的 <svg>
     const svg = this.svgRef.current;
     if (!svg) {
       return
     }
 
+    let fileName = fileNameRaw.trim();
+    if (fileName.length === 0) {
+      fileName = "figure.svg";
+    }
+
+    // 確保附檔名
+    const lower = fileName.toLowerCase();
+    if(!lower.endsWith(".svg")) {
+      fileName = fileName + ".svg";
+    }
 
     const svgCloned = svg.cloneNode(true) as SVGSVGElement;  // 避免直接影響原 <svg> 元素
     
@@ -308,7 +358,7 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
 
     const a = document.createElement("a");
     a.href = url;
-    a.download = "consumer-opt.svg";
+    a.download = fileName;
     document.body.appendChild(a);
     a.click();
 
@@ -333,11 +383,11 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
     const scene = this.state.scene;
     const viewport = this.state.viewport;
 
-    // 組合 tickVisibility 傳給 AxesView
-    const tickVisibility = {
-      showTickLines: this.state.showTickLines,
-      showTickLabels: this.state.showTickLabels,
-    }
+    // // 組合 tickVisibility 傳給 AxesView
+    // const tickVisibility = {
+    //   showTickLines: this.state.showTickLines,
+    //   showTickLabels: this.state.showTickLabels,
+    // }
 
         
     // --------------------------------------------------------
@@ -371,85 +421,59 @@ export class ConsumerOptGraphView extends React.Component<Props, State> {
       offsetY = 0;
     }
 
-
     return (
-      <div>
-        {/* 控制區: 下拉 + 勾選 */}
-        <div>
-          <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8 }}>
-            <label>
-              Ticks:
-              <select 
-                value={this.state.ticks} 
-                onChange={this.handleOnTicksChange} 
-                style={{ marginLeft: 6 }}
-              >
-                {ALLOWED_TICKS.map((ticksAllowedValue) => (
-                  <option key={`ticks-${ticksAllowedValue}`} value={ticksAllowedValue}>
-                    {ticksAllowedValue}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <input
-                type="checkbox"
-                checked={this.state.showTickLines}
-                onChange={this.handleOnShowTickLinesChange}
-              />
-              顯示刻度線
-            </label>
-
-            <label>
-              <input
-                type="checkbox"
-                checked={this.state.showTickLabels}
-                onChange={this.handleOnShowTickLabelsChange}
-              />
-              顯示刻度文字
-            </label>
-            
-            {/* 匯出按鈕 */}
-            <button 
-              onClick = {this.handleExportSvg}
-              style={{ marginLeft: 12 }}
-            >
-              Export SVG
-            </button>
-
-
-          </div>
-
-        </div>
-
-        {/* SVG 外框：畫布容器 */}
-        <svg 
-          ref={this.svgRef}
-          width={this.svgWidth} 
-          height={this.svgHeight} 
-          style={{ border: "1px solid #ddd" }}
+      // SVG 外框：畫布容器
+      <svg
+        ref={this.svgRef}
+        width={this.svgWidth}
+        height={this.svgHeight}
+        style={{ border: "1px solid #ddd" }}
+      >
+        {/* ✅ 圖表標題（期刊圖常見：圖內上方置中） */}
+        {/* <text
+          x={this.svgWidth / 2}
+          y={14}
+          fontSize={14}
+          textAnchor="middle"
+          fill="currentColor"
         >
-          {/* AxesView 自己會 translate(margin.left, margin.top) */}
-          <AxesView 
-            viewport = {viewport}
-            margin={this.svgMargin}
-            offset={{ x: offsetX, y: offsetY }}
-            ticks={this.state.ticks}
-            tickVisibility={tickVisibility}
+          {this.props.chartTitle}
+        </text> */}
+        {this.props.showChartTitle ? (
+          <text
+            x={this.svgWidth / 2}
+            y={14}
+            fontSize={this.props.chartTitleFontSize}
+            textAnchor="middle"
+            fill="currentColor"
+          >
+            {this.props.chartTitle}
+          </text>
+        ) : null}
+        
+        {/* AxesView 自己會 translate(margin.left, margin.top) */}
+        <AxesView
+          viewport={viewport}
+          margin={this.svgMargin}
+          offset={{ x: offsetX, y: offsetY }}
+          ticks={this.props.ticks}
+          tickVisibility={this.props.tickVisibility}
+          xLabel={this.props.xLabel}
+          yLabel={this.props.yLabel}
+          showXLabel={this.props.showXLabel}
+          showYLabel={this.props.showYLabel}
+        />
+        {/* 內容區的群組 <g>：把「畫圖原點 (0,0)」從整張 SVG 的左上角，搬到內容區的左上角 */}
+        <g transform={`translate(${this.svgMargin.left + offsetX},${this.svgMargin.top + offsetY})`}>
+          {/* SvgSceneView：吃 scene.drawables 畫出 budget/indiff/opt/text
+              同時把拖曳事件回報給 GraphView */}
+          <SvgSceneView
+            scene={scene}  // Parent Component => Child Component
+            onPointDrag={this.handlePointDrag}  // Child Component => Parent Component
+            onTextDrag={this.handleTextDrag}
           />
-
-          {/* 內容區的群組 <g>：把「畫圖原點 (0,0)」從整張 SVG 的左上角，搬到內容區的左上角 */}
-          <g transform={`translate(${this.svgMargin.left + offsetX},${this.svgMargin.top + offsetY})`}>
-            {/* SvgSceneView：吃 scene.drawables 畫出 budget/indiff/opt/text
-                同時把拖曳事件回報給 GraphView */}
-            <SvgSceneView
-              scene={scene} // Parent Component => Child Component
-              onPointDrag={this.handlePointDrag}  // Child Component => Parent Component
-            />
-          </g>
-        </svg>
-      </div>
+        </g>
+      </svg>
     );
   }
 }

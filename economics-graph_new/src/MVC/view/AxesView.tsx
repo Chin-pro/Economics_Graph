@@ -57,6 +57,14 @@ type Props = {
   // plot 區 可用 inner 區塊內的偏移(用於置中)
   // 這個 offset 是「已扣掉 margin 的內容區」內的位移量(往右、往下)
   offset?: { x: number; y: number };
+
+  // 軸變數名稱
+  xLabel?: string;
+  yLabel?: string;
+
+  // 可分別控制是否顯示
+  showXLabel?: boolean;
+  showYLabel?: boolean;
 };
 
 
@@ -66,9 +74,16 @@ type Props = {
 //   （如果你要 state，可以寫 React.Component<Props, State>）
 // ------------------------------------------------------------
 export class AxesView extends React.Component<Props> {
+  // 工具: 估算文字寬度 (不用 DOM measurement)
+    // 每個字寬約 0.6 em
+    private approxTextWidth(text: string, fontSize: number): number {
+      return text.length * fontSize * 0.6;
+    }
+  
   // render()：class component 必備方法
   // React 會在「第一次掛載」或「props 改變」時呼叫 render 重新產出 JSX
   render() {
+
     // --------------------------------------------------------
     // 把 props 解出來，讓下面 JSX 讀起來更清楚
     // 也可以用解構：const { width, height, margin } = this.props;
@@ -82,7 +97,6 @@ export class AxesView extends React.Component<Props> {
     const svgInnerHeight = vp.getInnerHeight();    // 內容區高度
     const xEconDomain = vp.getXEconDomain();  // 經濟座標 x 的範圍 [xMin, xMax]
     const yEconDomain = vp.getYEconDomain();  // 經濟座標 y 的範圍 [yMin, yMax]
-    
 
     const margin = this.props.margin;
     
@@ -148,6 +162,78 @@ export class AxesView extends React.Component<Props> {
       visibility,
     });
 
+    // 軸標籤預設值
+    let xLabel = "x";
+    if (this.props.xLabel !== undefined) {
+      xLabel = this.props.xLabel;
+    }
+
+    let yLabel = "y";
+    if (this.props.yLabel !== undefined) {
+      yLabel = this.props.yLabel;
+    }
+
+    // show 預設 true
+    let showX = true;
+    if (this.props.showXLabel !== undefined) {
+      showX = this.props.showXLabel;
+    }
+    let showY = true;
+    if (this.props.showYLabel !== undefined) {
+      showY = this.props.showYLabel;
+    }
+
+    
+    // --------------------------------------------------------
+    // 避免 yLabel 與 tick label 重疊 + 超出畫布：
+    // 1) 估算 y 軸 tick label 的最大寬度（用 yDomain 最大值當代表）
+    // 2) yLabel 放在 y 軸中間（避免上方超出）
+    // 3) yLabel 再往左退：tickLen + tickLabelWidth + padding
+    // 4) 若 yLabel 太長（旋轉後沿垂直方向），就自動縮小字體
+    // --------------------------------------------------------
+    const tickFont = style.fontSize;
+
+    const maxAbsX = Math.max(Math.abs(xEconDomain[0]), Math.abs(xEconDomain[1]));
+    const maxAbsY = Math.max(Math.abs(yEconDomain[0]),Math.abs(yEconDomain[1]));
+
+    // const tickXSample = maxAbsX.toFixed(2);
+    const tickYSample = maxAbsY.toFixed(2);
+    // const tickXLabelWidth = this.approxTextWidth(tickXSample, tickFont);
+    const tickYLabelWidth = this.approxTextWidth(tickYSample, tickFont);
+
+    // xLabel，yLabel 預設字體大小
+    let xLabelFontSize = 12;
+    let yLabelFontSize = 12;
+
+    const xLabelNeed = this.approxTextWidth(xLabel, xLabelFontSize);
+
+    // yLabel 旋轉後的「垂直占用長度」約等於 文字寬度
+    const yLabelNeed =this.approxTextWidth(yLabel, yLabelFontSize);
+
+    // 如果太長，縮小字體 (下限 8)
+    const maxAllow = svgInnerHeight * 0.9;
+    
+    if (xLabelNeed > maxAllow && xLabel.length > 0) {
+      const scaled = (maxAllow / (xLabel.length * 0.6));
+      if (scaled < xLabelFontSize) {
+        xLabelFontSize = Math.max(8, Math.floor(scaled));
+      }
+    }
+
+    if (yLabelNeed > maxAllow && yLabel.length > 0) {
+      const scaled = (maxAllow / (yLabel.length * 0.6));
+      if (scaled < yLabelFontSize) {
+        yLabelFontSize = Math.max(8, Math.floor(scaled));
+      }
+    }
+
+    // xLabel 放在 x 軸中間 與 yLabel 放在 y 軸中間
+    const xLabelCenterX = svgInnerWidth / 2;
+    const yLabelCenterY = svgInnerHeight / 2;
+
+    // 往左退更多，確保不壓到 tick label
+    const yLabelX = yAxisXPixel - style.tickLen - tickYLabelWidth - 18;
+
 
     // --------------------------------------------------------
     // 回傳 SVG 的 <g> 群組（group）
@@ -193,6 +279,51 @@ export class AxesView extends React.Component<Props> {
         {/* 由 visibility 決定是否出現線/字體，畫出刻度（X 軸、Y 軸） */}
         {xTickNodes}
         {yTickNodes}
+
+        {/* ✅ X 軸變數名稱（放在右端附近） */}
+        {/* <text       
+          x={xLabelCenterX}
+          y={xAxisYPixel + style.tickLen + style.fontSize * 2 + 8}
+          fontSize={xLabelFontSize}
+          textAnchor="middle"
+          fill="currentColor"
+        >
+          {xLabel}
+        </text> */}
+        {showX ? (
+          <text
+            x={xLabelCenterX}
+            y={xAxisYPixel + style.tickLen + style.fontSize * 2 + 8}
+            fontSize={xLabelFontSize}
+            textAnchor="middle"
+            fill="currentColor"
+          >
+            {xLabel}
+          </text>
+        ) : null}
+
+        {/* ✅ Y 軸變數名稱：置中 + 避開 tick label + rotate(-90) */}
+        {/* <text
+          x={yLabelX}
+          y={yLabelCenterY}
+          fontSize={yLabelFontSize}
+          textAnchor="middle"
+          fill="currentColor"
+          // transform={`rotate(-90 ${yLabelX} ${yLabelCenterY})`}
+        >
+          {yLabel}
+        </text> */}
+        {showY ? (
+          <text
+            x={yLabelX}
+            y={yLabelCenterY}
+            fontSize={yLabelFontSize}
+            textAnchor="middle"
+            fill="currentColor"
+          >
+            {yLabel}
+          </text>
+        ) : null}
       </g>
     );
   }
