@@ -3,20 +3,20 @@
 // 經濟座標 -> 像素座標（不依賴 React）
 // 注意：螢幕座標 y 往下變大，所以這裡把 y 反轉
 export class Viewport {
-  private readonly svgInnerWidth: number;
-  private readonly svgInnerHeight: number;
+  private readonly innerWidth: number;
+  private readonly innerHeight: number;
   private readonly xEconDomain: [number, number];
   private readonly yEconDomain: [number, number];
 
   // 建構子
   constructor(
-    svgInnerWidth: number,
-    svgInnerHeight: number,
+    innerWidth: number,
+    innerHeight: number,
     xEconDomain: [number, number],  // 經濟座標 x 的範圍
     yEconDomain: [number, number],  // 經濟座標 y 的範圍
   ) {
-    this.svgInnerWidth = svgInnerWidth;
-    this.svgInnerHeight = svgInnerHeight;
+    this.innerWidth = innerWidth;
+    this.innerHeight = innerHeight;
     this.xEconDomain = xEconDomain;
     this.yEconDomain = yEconDomain;
   }
@@ -26,12 +26,12 @@ export class Viewport {
   // =========================================================
   // 內容區寬度 (innerW)
   getInnerWidth(): number {
-    return this.svgInnerWidth;
+    return this.innerWidth;
   }
 
   // 內容區高度 (innerH)
   getInnerHeight(): number{
-    return this.svgInnerHeight
+    return this.innerHeight
   }
 
   // 取得 xDomain (經濟座標 x 的範圍)
@@ -59,7 +59,7 @@ export class Viewport {
       return 0;
     }
 
-    return ((xEconValue - d0) / (d1 - d0)) * this.svgInnerWidth;
+    return ((xEconValue - d0) / (d1 - d0)) * this.innerWidth;
   }
 
   yEconToYPixel(yEconValue: number): number {
@@ -72,7 +72,7 @@ export class Viewport {
     }
 
     const t = (yEconValue - d0) / (d1 - d0);
-    return this.svgInnerHeight * (1 - t);  // "* (1-t)": 反轉
+    return this.innerHeight * (1 - t);  // "* (1-t)": 反轉
   }
 
   // map: 把一個點 (x,y) 轉換成像素點
@@ -93,14 +93,14 @@ export class Viewport {
     const d1 = this.xEconDomain[1];
 
     // 防呆機制
-    if (this.svgInnerWidth === 0) {
+    if (this.innerWidth === 0) {
       return d0;
     }
     if (d1 === d0) {
       return d0;
     }
 
-    const t = px / this.svgInnerWidth;
+    const t = px / this.innerWidth;
     return d0 + t * (d1 - d0);
   }
 
@@ -109,7 +109,7 @@ export class Viewport {
     const d0 = this.yEconDomain[0];
     const d1 = this.yEconDomain[1];
 
-    if (this.svgInnerHeight === 0) {
+    if (this.innerHeight === 0) {
       return d0;
     }
     if (d1 === d0) {
@@ -117,7 +117,7 @@ export class Viewport {
     }
     
     // 注意：y 方向有反轉，所以 t = 1 - (py / height)
-    const t = 1 - py / this.svgInnerHeight;
+    const t = 1 - py / this.innerHeight;
     return d0 + t * (d1 - d0);
   }
 }

@@ -10,6 +10,7 @@
 
 // 定義一個 二維向量 / 座標
 export type Vec2 = { x: number; y: number };
+export type Point2D = Vec2;
 
 // 線條樣式 (可選，以下屬性皆添加"?")
 export type StrokeStyle = {
@@ -33,15 +34,15 @@ export type TextSpan = {
   fontStyle?: string;
   fontWeight?: string;
   kind?: "normal" | "sup" | "sub";
-}
+};
 
 // 線段
 export type LineDrawable = {
-  kind: "line";  // 辨識標籤，告訴 renderer，這筆資料是一條線 (renderer 會 透過 switch (d.kind) 決定怎麼畫)
-  id: string;    // 唯一識別 (Ex: budget)
-  a: Vec2;       // 線段端點 (像素座標)
-  b: Vec2;
-  stroke?: StrokeStyle;  // 可選線條樣式
+  kind: "line";            // 辨識標籤，告訴 renderer，這筆資料是一條線 (renderer 會 透過 switch (d.kind) 決定怎麼畫)
+  id: string;              // 唯一識別 (Ex: budget)
+  minEndPoint: Vec2;       // 線段端點 (像素座標)
+  maxEndPoint: Vec2;
+  stroke?: StrokeStyle;    // 可選線條樣式
 };
 
 // 折線 (點列)
@@ -96,7 +97,7 @@ export type MathSvgDrawable = {
   displayMode?: boolean;
 };
 
-// union type: Drawable 可以是以下4種其中之一
+// union type: Drawable 可以是以下5種其中之一
 export type Drawable =
   | LineDrawable
   | PolylineDrawable

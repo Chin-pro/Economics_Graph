@@ -1,11 +1,19 @@
 /* types.ts */
-//   - 放 UI 會用到的型別，它不是資料流主角，但讓型別一致
 
-export type Point = { x: number; y: number };
+// General Type 基本規格
+export interface BaseViewOption {
+  showEquationLabels: boolean;  // 是否顯示方程式文字標籤
+  labelFontSize: number;        // 字體大小
 
-export type Margin = {
-  top: number;
-  right: number;
-  bottom: number;
-  left: number;
+  showOpt: boolean;             // 是否顯示 Opt
+  optPointColor: string,      // Opt 點顏色
+  optTextColor: string,         // Opt 文字顏色
 };
+
+// Consumer Specific Type
+export type ConsumerViewOptions = BaseViewOption & {
+  budgetColor: string;    // Consumer Model: 預算線顏色
+  indiffColor: string;    // Consumer Model: 無意曲線顏色
+}
+
+export type typePlotOffset = { x:number ; y: number };

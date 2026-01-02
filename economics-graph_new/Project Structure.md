@@ -126,8 +126,8 @@ src/
 
 ### `AppView.tsx` — Composition Root / Glue Layer
 
-**角色：** 應用程式最上層 View（組裝者）  
-**負責：**
+### **角色：** 應用程式最上層 View（組裝者）  
+### **負責：**
 
 - 建立 `ConsumerOptModel`、`ConsumerOptController`
 - 保存「UI 控制面板的 state」（ticks、顯示/隱藏、字體大小、標題、匯出檔名…）
@@ -136,11 +136,16 @@ src/
 - 收到 view-options 更新 → 呼叫 `controller.setViewOptions(patch)`
 - 呼叫 `graphRef.exportSvg(...)` 進行匯出
 
-**不負責：**
+### **不負責：**
 
 - 不做經濟計算
 - 不產生 drawables
 - 不做 pointer hit-test
+
+### 設計邏輯
+- 如果將這些規則塞在 View 或 Controller 其他地方，
+  會把「渲染/互動」和「幾何位置規則綁再一起」，日後就很難擴充/測試/重用
+- 拆分後，任何圖表只要符合 Drawable 格式，就能共用這套 label 幾何規則
 
 ---
 
@@ -314,11 +319,23 @@ src/
 
 ### `types.ts` (controller folder)
 
-**角色：** ViewOptions / Controller options 型別集中  
-**負責：**
-
+### **角色：** ViewOptions / Controller options 型別集中  
+### **負責：**
 - `ConsumerViewOptions`：show/hide、顏色、字體大小等 view-side configs
 - 可作為 controller API 的穩定契約
+
+### **設計邏輯：**
+- 將「general type」`BaseViewOptions`和「specific type」(Ex: `ConsumerViewOption`,  `ProducerViewOption`, `ISLM`, `ASAD`, ...)拆解
+    - 透過 Union Type 和 Inheritance 繼承 BaseViewOptions
+    - Hint: 維持 SRP + Single Source of Truth (cross-layer contract)
+- Ceneral Type: 
+    - `showEquationLabels`、
+    - `labelFontSize`、
+    - `optPointColor`、
+    - `optTextColor`
+- Specific Type:
+    - Consumer: `budgetColor`、`indiffColor`
+    - Producer: `isoQuantColor`、`isoCostColor`
 
 ---
 
@@ -337,11 +354,18 @@ src/
   - optimum (Opt)
   - utility at point
   - indifference curve points
+- 負責回答以下問題:
+  - 怎麼找到 label 的 anchor (依附點)
+  - 怎麼用 offset (拖曳後的偏移) 算出 label 真正位置
+  - 怎麼把 label 限制在繪圖區內 (clamp)
 
 **不負責：**
 
 - 不知道 Viewport / SVG / drawables
 - 不處理 UI 或事件
+- 不管 React、不管事件、不管經濟計算
+
+
 
 ---
 
