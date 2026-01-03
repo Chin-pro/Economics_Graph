@@ -58,30 +58,30 @@ export function budgetLineEndpoints(params: {
 // Cobb-Douglas: U = x^a y^(1-a)
 // 若給定 U0，則 y = (U0 / x^a)^(1/(1-a))
 export function indifferenceCurvePoints(params: {
-  a: number;
+  exponent: number;
   U0: number;
-  xMin: number;
-  xMax: number;
-  n: number;
+  xEconMin: number;
+  xEconMax: number;
+  samplePoints: number;
 }): Point[] {  // 回傳 Point[]: 一串點
   // Destructuring
-  const { a, U0, xMin, xMax, n } = params;
+  const { exponent, U0, xEconMin, xEconMax, samplePoints } = params;
   
   // 宣告陣列 pts，之後會將每個取樣點 push 進去
-  const pts: Point[] = [];
-  const step = (xMax - xMin) / (n - 1);  // 在 [xMin, xMax] 之間取 n 個點，共 n-1 個間隔
+  const points: Point[] = [];
+  const step = (xEconMax - xEconMin) / (samplePoints - 1);  // 在 [xMin, xMax] 之間取 n 個點，共 n-1 個間隔
 
   let i = 0;
-  while (i < n) {
-    const x = xMin + step * i;
-    const y = Math.pow(U0 / Math.pow(x, a), 1 / (1 - a));
+  while (i < samplePoints) {
+    const x = xEconMin + step * i;
+    const y = Math.pow(U0 / Math.pow(x, exponent), 1 / (1 - exponent));
     if (Number.isFinite(y)) {  // 檢查 y 是否為有限數: 確認不是Infinity、不是-Infinity、不是NaN
-      pts.push({ x, y });
+      points.push({ x, y });
     }
     i += 1;
   }
 
-  return pts;
+  return points;
 }
 
 // 效用函數

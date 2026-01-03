@@ -811,10 +811,10 @@ export class SvgSceneView extends React.Component<Props> {
         nodes.push(
           <line
             key={d.id}
-            x1={d.a.x}
-            y1={d.a.y}
-            x2={d.b.x}
-            y2={d.b.y}
+            x1={d.minEndPoint.x}
+            y1={d.minEndPoint.y}
+            x2={d.maxEndPoint.x}
+            y2={d.maxEndPoint.y}
             stroke={stroke}
             strokeWidth={w}
             strokeDasharray={dash ? dash.join(" ") : undefined}

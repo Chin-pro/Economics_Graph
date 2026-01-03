@@ -29,7 +29,7 @@ export type ConsumerParams = {
   I: number;
   px: number;
   py: number;
-  a: number;
+  exponent: number;
 };
 
 // ------------------------------------------------------------
@@ -71,8 +71,8 @@ export class ConsumerOptModel {
   }
 
   // 設定 alpha（x 的權重）
-  setAlpha(a: number) {
-    this.ModelParams.a = a;
+  setAlpha(alpha: number) {
+    this.ModelParams.exponent = alpha;
   }
 
   // 設定兩個價格
@@ -98,7 +98,7 @@ export class ConsumerOptModel {
   computeOptimum() {
     const p = this.ModelParams;
     // 回傳通常是 {x, y}（經濟座標）
-    return cobbDouglasOptimum({ a: p.a, I: p.I, px: p.px, py: p.py });
+    return cobbDouglasOptimum({ a: p.exponent, I: p.I, px: p.px, py: p.py });
   }
 
   // computeUtilityAt：給定任意 (x,y) 計算效用
@@ -106,7 +106,7 @@ export class ConsumerOptModel {
   computeUtilityAt(xEcon: number, yEcon: number): number {
     const p = this.ModelParams;
     // 回傳一個 number：U
-    return utilityCobbDouglas({ a: p.a, x: xEcon, y: yEcon });
+    return utilityCobbDouglas({ a: p.exponent, x: xEcon, y: yEcon });
   }
 
   // computeIndifferenceCurve：給定 U0，回傳無異曲線的取樣點
@@ -115,8 +115,14 @@ export class ConsumerOptModel {
   // - n：取樣點數
   //
   // 回傳：Point[]（經濟座標點列）
-  computeIndifferenceCurve(U0: number, xMin: number, xMax: number, n: number) {
-    const p = this.ModelParams;
-    return indifferenceCurvePoints({ a: p.a, U0, xMin, xMax, n });
+  computeIndifferenceCurve(U0: number, xEconMin: number, xEconMax: number, samplePoints: number) {
+    const params = this.ModelParams;
+    return indifferenceCurvePoints({ 
+      exponent: params.exponent, 
+      U0: U0, 
+      xEconMin: xEconMin, 
+      xEconMax: xEconMax, 
+      samplePoints: samplePoints 
+    });
   }
 }

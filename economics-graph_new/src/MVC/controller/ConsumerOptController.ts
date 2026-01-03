@@ -551,7 +551,7 @@ export class ConsumerOptController {
       while (i < drawables.length) {
         const drawableType = drawables[i];
         if (drawableType.kind === "line" && drawableType.id === "budget") {
-          return { x: (drawableType.a.x + drawableType.b.x)/2 , y: (drawableType.a.y + drawableType.b.y) / 2 };
+          return { x: (drawableType.minEndPoint.x + drawableType.maxEndPoint.x)/2 , y: (drawableType.minEndPoint.y + drawableType.maxEndPoint.y) / 2 };
         }
         i++;
       }
@@ -697,7 +697,11 @@ export class ConsumerOptController {
     }
 
     // 取樣無異曲線（回傳 econ 點）
-    const curveEconPts = this.model.computeIndifferenceCurve(U0, xMin, xEconMax, 60);
+    const curveEconPts = this.model.computeIndifferenceCurve(
+      U0, 
+      xMin, 
+      xEconMax, 
+      60);
 
     // econ -> pixel（line/polyline/point 都要 pixel 才能畫）
     const curvePxPts = curveEconPts.map((pt) => vp.econToPixelMapping(pt));
@@ -709,8 +713,8 @@ export class ConsumerOptController {
     const budgetLine: Drawable = {
       kind: "line",
       id: "budget",
-      a: vp.econToPixelMapping(budget.p1),
-      b: vp.econToPixelMapping(budget.p2),
+      minEndPoint: vp.econToPixelMapping(budget.p1),
+      maxEndPoint: vp.econToPixelMapping(budget.p2),
       stroke: { width: 2, color: this.budgetColor },
     }
     // 無異曲線：polyline
@@ -777,9 +781,9 @@ export class ConsumerOptController {
           id: "utility-eq",
           pos: utilPos,
           // 顯示一般式 + 目前 a 值（用純文字，SVG 不做上標）
-          text: `U(x,y) = x^a y^(1-a),  a=${this.formatNum(p.a)}`,
+          text: `U(x,y) = x^a y^(1-a),  a=${this.formatNum(p.exponent)}`,
           // text: "U(x,y)=x^α y^(1-α)",
-          spans: this.buildUtilitySpans(p.a, equationFontSize),
+          spans: this.buildUtilitySpans(p.exponent, equationFontSize),
           fontSize: equationFontSize,
           fill: { color: this.indiffColor },
           draggable: true,

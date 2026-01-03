@@ -54,7 +54,7 @@ const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10];
 type State = {
   // 模型相關 (UI 顯示用)
   I: number;
-  a: number;
+  exponent: number;
   px: number;
   py: number;
 
@@ -121,12 +121,12 @@ export default class AppView extends React.Component<
     super(props);
 
     // 1) 初始化參數
-    const initialParameters: ConsumerParams = { I: 20, a: 0.5, px: 1, py: 1}
+    const initialParameters: ConsumerParams = { I: 20, exponent: 0.5, px: 1, py: 1}
 
     // 2) 初始化 UI state（slider 顯示用）
     this.state = { 
       I: initialParameters.I, 
-      a: initialParameters.a,
+      exponent: initialParameters.exponent,
       px: initialParameters.px,
       py: initialParameters.py,
 
@@ -233,7 +233,7 @@ export default class AppView extends React.Component<
 
     // 確保 mounted 後 UI state 跟 model params 完全一致
     const params = this.model.getModelParams();
-    this.setState({ I: params.I, a: params.a, px: params.px, py: params.py });
+    this.setState({ I: params.I, exponent: params.exponent, px: params.px, py: params.py });
   }
 
 
@@ -265,7 +265,7 @@ export default class AppView extends React.Component<
   // ----------------------------------------------------------
   private handleParamsFromController() {
     const params = this.model.getModelParams();
-    this.setState({ I: params.I, a: params.a, px: params.px, py: params.py });
+    this.setState({ I: params.I, exponent: params.exponent, px: params.px, py: params.py });
   }
 
 
@@ -625,9 +625,9 @@ export default class AppView extends React.Component<
               min={0.1}
               max={0.9}
               step={0.01}
-              value={Number(this.state.a.toFixed(2))}
+              value={Number(this.state.exponent.toFixed(2))}
               onChange={(nextA) => {
-                this.setState({ a: nextA });
+                this.setState({ exponent: nextA });
                 this.controller.onAlphaChange(nextA);
               }}
             />

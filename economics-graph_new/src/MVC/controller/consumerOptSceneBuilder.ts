@@ -44,12 +44,15 @@ import { computePlotInnerSize } from "./consumerOptPlotSize";
 // - resolveLabelPos: 用 anchor + offsets 算出最後 label 的位置 (可拖曳後記住偏移)
 import { 
     clampToPlot, 
-    findLabelAnchor, 
+    // findLabelAnchor, 
+    findLabelAnchorsOnePass,  // 改用一次掃描 anchors 的 API，避免每個 label 重複 linear scan
     resolveLabelPos,
+    buildFixedEquationAnchors,  // 取得「indiff-eq / utility-eq 的穩定 anchors」
     type PlotArea,      // clamp 規則需要的最小環境參數
     type PixelPoint,
     type PixelOffset,
     type LabelKey,
+    OPT_LABEL_NUDGE,    // single sourth of truth
 } from "./consumerOptLabel";
 
 // buildBudgetSpans / buildIndiffSpans / buildUtilitySpans:
@@ -83,9 +86,9 @@ const CURVE_SAMPLE_COUNT = 60;
 // 避免 x=0：因為 indiff curve 常用到 x^a，x=0 容易爆 NaN/Infinity
 const CURVE_XMIN_EPS = 0.0001;
 
-// Opt label 預設相對位移（避免文字壓在點上）
-const OPT_LABEL_DX = 8;
-const OPT_LABEL_DY = -8;
+// // Opt label 預設相對位移（避免文字壓在點上）
+// const OPT_LABEL_DX = 8;
+// const OPT_LABEL_DY = -8;
 
 
 // Opt point 半徑
@@ -96,6 +99,19 @@ const STROKE_WIDTH = 2;
 
 // label clamp padding：避免文字貼邊被裁切/難以點擊
 const LABEL_CLAMP_PADDING_PX = 12;
+
+// budget-eq anchor 是「線段中點」，若 offset = 0,0 常會壓在線上，
+// 初始排版會難以閱讀/難以點擊；但這只是「初始位置」：
+// 一旦使用者拖曳，dragOffset 會覆蓋這個預設值。
+const BUDGET_EQ_DEFAULT_OFFSET: PixelOffset = { offsetDx: 10, offsetDy: 10 };
+
+// indiff-eq 的 anchor 已經被設計成「固定註記」（由 buildFixedEquationAnchors 用 fontSize 排版決定），
+// 再額外加 offset（例如 10,-10）反而變成新的 magic number，語義也矛盾。
+const INDIFF_EQ_DEFAULT_OFFSET: PixelOffset = { offsetDx: 0, offsetDy: 0 };
+
+// utility-eq 是固定註記（固定 anchor），不需要額外 offset
+const UTILITY_EQ_DEFAULT_OFFSET: PixelOffset = { offsetDx: 0, offsetDy: 0 };
+
 
 
 // ------------------------------------------------------------
@@ -141,7 +157,7 @@ type DomainConfig = {
 };
 
 // ------------------------------------------------------------
-// build() 的輸出（外部呼叫方式不變）：
+// buildScene() 的輸出（外部呼叫方式不變）：
 // - scene：Renderer 要畫的資料
 // - viewport：座標映射器（互動/同步要用）
 // ------------------------------------------------------------
@@ -201,7 +217,7 @@ type BuildContext = {
   labelOffsets: LabelOffsets;
 
   // model 參數（快照）
-  params: { I: number; px: number; py: number; a: number };
+  params: { I: number; px: number; py: number; exponent: number };
 
   // domain / plot
   domain: DomainConfig;
@@ -216,6 +232,75 @@ type BuildContext = {
 };
 
 
+// ------------------------------------------------------------
+//  Heavy cache：記住「重算結果」
+//  - heavy 的定義：
+//    computeDomain / computePlotAndViewport / computeEconomics / computePixelMappings
+//
+//  - light 的定義：
+//    - buildBaseDrawables（含顏色，通常很便宜）
+//    - appendOptDrawables / equation labels / clamp / sync
+//
+//  - cache key：innerAvailWidth/Height + (I, px, py, a)
+//  - 只要這些不變，就視為 econ / curve / viewport 都可重用
+// ------------------------------------------------------------
+type HeavyCache = {
+    key: string;
+    domain: DomainConfig;
+    plot: PlotConfig;
+    econ: EconResults;
+    pixel: PixelResults;
+};
+
+
+// ------------------------------------------------------------
+//  Equation label 規格標
+//  - 集中管理: anchor key / default offset / text / spans / color
+//  - 讓新增 lable 不再複製 3 份 appendXXXLabel()
+// ------------------------------------------------------------
+type EquationLabelSpec = {
+    key: LabelKey;    // 這裡只放 equation label keys (utility/budget/indiff)
+    defaultOffset: PixelOffset;
+    buildText: (context: BuildContext) => string;
+    buildSpans: (context: BuildContext, fontSize: number) => any;
+    getFillColor: (context: BuildContext) => string;
+
+}
+
+const EQUATION_LABEL_SPECS: EquationLabelSpec[] = [
+  {
+    key: "utility-eq",
+    defaultOffset: { offsetDx: 0, offsetDy: 0 },
+    buildText: (ctx) =>
+      "U(x,y) = x^a y^(1-a),  a=" + formatNum(ctx.params.exponent),
+    buildSpans: (ctx, fontSize) => buildUtilitySpans(ctx.params.exponent, fontSize),
+    getFillColor: (ctx) => ctx.controlOptions.indiffColor,
+  },
+  {
+    key: "budget-eq",
+    defaultOffset: BUDGET_EQ_DEFAULT_OFFSET,
+    buildText: (ctx) =>
+      formatNum(ctx.params.px) +
+      "x + " +
+      formatNum(ctx.params.py) +
+      "y = " +
+      formatNum(ctx.params.I),
+    buildSpans: (ctx, fontSize) =>
+      buildBudgetSpans(ctx.params.px, ctx.params.py, ctx.params.I, fontSize),
+    getFillColor: (ctx) => ctx.controlOptions.budgetColor,
+  },
+  {
+    key: "indiff-eq",
+    defaultOffset: INDIFF_EQ_DEFAULT_OFFSET,
+    buildText: (ctx) =>
+      "y = (U0 / x^a)^(1/(1-a)),  U0=" + formatNum(ctx.econ.UtilityAtOptPoint),
+    buildSpans: (ctx, fontSize) =>
+      buildIndiffSpans(ctx.econ.UtilityAtOptPoint, ctx.params.exponent, fontSize),
+    getFillColor: (ctx) => ctx.controlOptions.indiffColor,
+  },
+];
+
+
 
 export class ConsumerOptSceneBuilder {
     // model：提供經濟計算（budget/optimum/utility/curve）
@@ -224,6 +309,9 @@ export class ConsumerOptSceneBuilder {
     // innerAvailWidth/Height：內部可用繪圖空間 pixel 尺寸
     private readonly innerAvailWidth: number;
     private readonly innerAvailHeight: number;
+
+    // Cache 欄位
+    private heavyCache: HeavyCache | null;
 
     // ------------------------------------------------------------
     //  contructor
@@ -249,52 +337,28 @@ export class ConsumerOptSceneBuilder {
         this.model = args.model;
         this.innerAvailWidth = args.innerAvailWidth;
         this.innerAvailHeight = args.innerAvailHeight;
+        this.heavyCache = null;
     }
 
     // ------------------------------------------------------------
-    //  buildScene (Public API)
-    //  - 以「流程管線」方式建立 scene + viewport
-    //  - build() 保持非常薄：只負責按順序呼叫各步驟（可讀性高）
-    
-    //  Input：
-    //  - options：ConsumerViewOptions（顯示/顏色/字體）
-    //  - labelOffsets：LabelOffsets（拖曳偏移，key=labelId）
-    
-    //  Output：
-    //  - { scene, viewport }
-    
-    //  設計邏輯：
-    //  - build() 保持「流程總覽」，細節拆進 private methods
-    //  - 先建立 contex（集中管理中間結果）
-    //  - 依序：讀參數 -> domain -> plot/viewport -> econ 計算 -> pixel 轉換 -> drawables 組裝 -> labels -> finalize
+    // buildScene（Public API）- 外部呼叫方式不變
+    // 1) initContext（拿 params + 放預設值）
+    // 2) buildHeavyIfNeeded（cache hit → 直接套用；miss → 重算並存入 cache）
+    // 3) buildLight（基礎圖元 + labels + clamp + sync）
+    // 4) finalize
     // ------------------------------------------------------------
-    buildScene(args: BuildSceneInput):  BuildSceneOutput {
+    buildScene(args: BuildSceneInput): BuildSceneOutput {
         const context = this.initContext(args);
 
-        // 1) 決定 domain (xEconMax/yEconMax/xMin)
-        this.computeDomain(context);
+        // heavy 計算: 有 cache 就跳過重算，避免 UI 拖曳造成塞車
+        this.buildHeavyScene(context);
 
-        // 2) 計算 plotSize 並建立 viewport
-        this.computePlotAndViewport(context);
+        // light 計算: 每次重建(便宜)，確保顏色/字體/顯示切換立即生效
+        this.buildLightScene(context);
 
-        // 3) 呼叫 model 計算 經濟結果 (budget/opt/U0/curve points)
-        this.computeEconomics(context);
-
-        // 4) 將 econ 結果映射到 pixel
-        this.computePixelMappings(context);
-
-        // 5) 建立基本圖形 (budget line + indiff curve)
-        this.buildBaseDrawables(context);
-
-        // 6) 依 options 追加 opt 點 與 opt label
-        this.appendOptDrawables(context);
-
-        // 7) 依 options 追加 equation labels，並且同步 opt-label 的 anchor 位置
-        this.appendEquationLabelsAndSync(context);
-
-        // 8) 組裝 SceneOutput 並回傳
         return this.finalize(context);
-    };
+    }
+
 
     // ============================================================
     //  Private Functions (internal)
@@ -356,6 +420,136 @@ export class ConsumerOptSceneBuilder {
 
         return context;
     };
+
+    // ------------------------------------------------------------
+    //  buildHeavyScene
+    //  - 避免 label 拖曳 / 字體大小 / 顏色等 UI 變動造成的重算曲線
+    //
+    //  - cache hit: 把 cache 的 heavy 結果寫回 context
+    //  - cache miss: 重算 heavy，並更新 cache
+    // ------------------------------------------------------------
+    private buildHeavyScene(context: BuildContext): void {
+        const key = this.makeHeavyCacheKey(context.params);
+
+        if (this.heavyCache) {
+            if (this.heavyCache.key === key) {
+                // cache hit: 重用 heavy 計算結果
+                context.domain = this.heavyCache.domain;
+                context.plot = this.heavyCache.plot;
+                context.econ = this.heavyCache.econ;
+                context.pixel = this.heavyCache.pixel;
+                return;
+            }
+        }
+
+        // cache miss：重算 heavy pipeline
+        this.computeDomain(context);
+        this.computePlotAndViewport(context);
+        this.computeEconomics(context);
+        this.computePixelMappings(context);
+
+        // immutability guard（避免未來不小心改到 cache 內容）
+        // - heavy cache 的結果應視為 immutable；freeze 能提早抓到「意外 mutation」的 bug
+        this.freezeHeavyResults(context);
+
+        // 更新 cache（重用 viewport / curvePixelPoints 的成果）
+        this.heavyCache = {
+            key: key,
+            domain: context.domain,
+            plot: context.plot,
+            econ: context.econ,
+            pixel: context.pixel,
+        };
+    }
+
+    // ------------------------------------------------------------
+    //  freezeHeavyResults
+    //  - 把 heavy 結果視為 immutable（開發期抓 bug）
+    // ------------------------------------------------------------
+    private freezeHeavyResults(context: BuildContext): void {
+        // domain/econ/pixel 都是 plain object，可凍結（viewport 是 class，不凍結）
+        Object.freeze(context.domain);
+
+        Object.freeze(context.econ.budget.endPoint1);
+        Object.freeze(context.econ.budget.endPoint2);
+        Object.freeze(context.econ.budget);
+
+        Object.freeze(context.econ.optEconPoint);
+
+        // curve arrays：凍結點物件，再凍結陣列
+        let i = 0;
+        while (i < context.econ.curveEconPoints.length) {
+        Object.freeze(context.econ.curveEconPoints[i]);
+        i++;
+        }
+        Object.freeze(context.econ.curveEconPoints);
+
+        Object.freeze(context.econ);
+
+        Object.freeze(context.pixel.optPointPixel);
+
+        let j = 0;
+        while (j < context.pixel.curvePixelPoints.length) {
+        Object.freeze(context.pixel.curvePixelPoints[j]);
+        j++;
+        }
+        Object.freeze(context.pixel.curvePixelPoints);
+
+        Object.freeze(context.pixel);
+    }
+
+    // ------------------------------------------------------------
+    //  makeHeavyCacheKey
+    //  - key 必須包含：畫布可用尺寸 + model params
+    //  - 這樣才不會在尺寸或參數變動時誤用 cache
+    // ------------------------------------------------------------
+    private makeHeavyCacheKey(params: { 
+        I:number; 
+        px: number; 
+        py: number; 
+        exponent: number 
+    }): string {
+        // 這裡使用 join 組字串
+        const parts: string[] = [];
+
+        parts.push(String(this.innerAvailWidth));
+        parts.push(String(this.innerAvailHeight));
+
+        parts.push(String(params.I));
+        parts.push(String(params.px));
+        parts.push(String(params.py));
+        parts.push(String(params.exponent));
+
+        return parts.join("|");
+    }
+
+    // ------------------------------------------------------------
+    //  buildLightScene
+    //  - 便宜的部分每次都跑
+    //  - 確保 UI 立刻生效（顏色、字體、顯示/隱藏）
+    // ------------------------------------------------------------
+    private buildLightScene(context: BuildContext): void {
+        this.buildBaseDrawables(context);
+        this.appendOptDrawables(context);
+
+        // 一次掃描取得 anchors（只從 drawables 蒐集）
+        const anchorsFromDrawables = findLabelAnchorsOnePass(context.drawables);
+
+        let anchors: Partial<Record<LabelKey, PixelPoint>> = anchorsFromDrawables;
+        if (context.controlOptions.showEquationLabels) {
+            const fontSize = context.controlOptions.labelFontSize;
+            const fixed = buildFixedEquationAnchors(fontSize);
+            anchors = {
+                ...anchorsFromDrawables,
+                ...fixed,
+            };
+        }
+
+        // Equation labels 用「規格表」一次處理，不再 3 個 appendXXX 重複邏輯
+        this.appendEquationLabels(context, anchors);
+
+    }
+
 
 
     // ------------------------------------------------------------
@@ -426,8 +620,6 @@ export class ConsumerOptSceneBuilder {
         const vp = new Viewport(
             plotSize.plotInnerWidth,    // innerWidth: number
             plotSize.plotInnerHeight,   // innerHeight: number
-            // [0, domain.xEconMax],
-            // [0, domain.yEconMax]
             xEconDomain,                // xEconDomain: [number, number]
             yEconDomain                 // yEconDomain: [number, number]
         );
@@ -457,13 +649,13 @@ export class ConsumerOptSceneBuilder {
 
         const modelBudget = this.model.computeBudget();
         const optEconPoint = this.model.computeOptimum();
-        const U0 = this.model.computeUtilityAt(optEconPoint.x, optEconPoint.y);
+        const utilityLevelAtOpt = this.model.computeUtilityAt(optEconPoint.x, optEconPoint.y);  // U0
 
         const curveEconPoints = this.model.computeIndifferenceCurve(
-            U0, 
+            utilityLevelAtOpt, 
             domain.xCurveMin, 
             domain.xEconMax, 
-            CURVE_SAMPLE_COUNT
+            CURVE_SAMPLE_COUNT,
         );
 
         const budget = {
@@ -472,10 +664,10 @@ export class ConsumerOptSceneBuilder {
         }
 
         context.econ = {
-            budget,
+            budget: budget,
             optEconPoint: optEconPoint,
-            UtilityAtOptPoint: U0,
-            curveEconPoints,
+            UtilityAtOptPoint: utilityLevelAtOpt,
+            curveEconPoints: curveEconPoints,
         };
     }
 
@@ -512,6 +704,7 @@ export class ConsumerOptSceneBuilder {
 
     // ------------------------------------------------------------
     //  buildBaseDrawables
+    //  - light，便宜，且顏色會跟 UI 走
     //  - 建立「一定存在」的 drawables：budget line + indiff curve
     //
     //  Input：
@@ -581,12 +774,20 @@ export class ConsumerOptSceneBuilder {
         const plotArea = this.getLabelPlotArea(context.plot);
 
         // opt-label 初始位置: 也進行 clamp，避免一開始就出界
-        const rawOptLabelPixel: PixelPoint = {
-            x: optPointPixel.x + OPT_LABEL_DX,
-            y: optPointPixel.y + OPT_LABEL_DY,
+        const optAnchor: PixelPoint = {
+            x: optPointPixel.x + OPT_LABEL_NUDGE.offsetDx,
+            y: optPointPixel.y + OPT_LABEL_NUDGE.offsetDy,
         }
 
-        const clampedOptLabelPixel = clampToPlot(plotArea, rawOptLabelPixel);
+        const rawOptLabelPos = resolveLabelPos({
+            labelKey: "opt-label",
+            anchor: optAnchor,
+            defaultOffsetDx: 0,
+            defaultOffsetDy: 0,
+            dragOffsetByLabelKey: context.labelOffsets,
+        });
+
+        const clampedOptLabelPixel = clampToPlot(plotArea, rawOptLabelPos);
 
         context.drawables.push({
             kind: "text",
@@ -601,179 +802,55 @@ export class ConsumerOptSceneBuilder {
     }
 
     // ------------------------------------------------------------
-    //  appendEquationLabelsAndSync
-    //  - 若 controlOptions.showEquationLabels 為 true：加入 utility/budget/indiff 方程式標籤（可拖曳）
-    //  - 同時：若 showOpt 為 true，重新 sync opt-label 的位置（讓 offset 能跟著 anchor）
-    //   使得 opt-label 的 anchor 位置每次 build 都能重新 resolve (避免 opt 點移動後 label 跟不上)
-    //
-    //  Input：
-    //  - context.controlOptions.showEquationLabels / equationFontSize
-    //  - context.params（a, px, py, I）
-    //  - context.econ.UtilityAtOptPoint（U0）
-    //  - context.labelOffsets（offsetDx/offsetDy）
-    //
-    //  Output：
-    //  - context.drawables 追加 text labels
-    //  - opt-label 若存在，更新其 pos
+    //  appendEquationLabels：用規格表生成 equation labels
+    //  - 消除 appendUtility/appendBudget/appendIndiff 3 份重複邏輯
     // ------------------------------------------------------------
-    private appendEquationLabelsAndSync(context: BuildContext): void {
+    private appendEquationLabels(
+        context: BuildContext,
+        anchors: Partial<Record<LabelKey, PixelPoint>>
+    ): void {
         const controlOption = context.controlOptions;
 
-        // if (!controlOption.showEquationLabels) {
-        //     return;
-        // }
-        if (controlOption.showEquationLabels) {
-            const fontSize = controlOption.labelFontSize;
-
-            this.appendUtilityEquationLabel(context, fontSize);
-            this.appendBudgetEquationLabel(context, fontSize);
-            this.appendIndiffEquationLabel(context, fontSize);
-        }
-
-        // opt label 要跟著 anchor/offset 重新解一次（避免 opt 移動後 label 跟不上）
-        // 永遠同步 opt-label（若 showOpt=false，syncOptLabelPosition 會自行 return）
-        this.syncOptLabelPosition(context);
-    }
-
-    // ------------------------------------------------------------
-    // appendUtilityEquationLabel
-    // - 加入 utility equation label（若可找到 anchor）
-    //
-    // Input：
-    // - context.params.a
-    // - fontSize（字體大小）
-    //
-    // Output：
-    // - push id="utility-eq" 的 text drawable
-    // ------------------------------------------------------------
-    private appendUtilityEquationLabel(context: BuildContext, fontSize: number): void {
-        const params = context.params;
-
-        const utilAnchor = findLabelAnchor(context.drawables, "utility-eq");
-        if (!utilAnchor) {
+        if (!controlOption.showEquationLabels) {
             return;
         }
 
-        // const offsetsDxDy = this.toDxDyOffsets(context.labelOffsets);
-
-        const utilPos = resolveLabelPos({
-            labelKey: "utility-eq",
-            anchor: utilAnchor,
-            defaultOffsetDx: 0,
-            defaultOffsetDy: 0,
-            dragOffsetByLabelKey: context.labelOffsets,
-        });
-
+        const fontSize = controlOption.labelFontSize;
         const plotArea = this.getLabelPlotArea(context.plot);
-        
-        // clamp：避免 label 初始/拖曳後跑出畫布
-        const clampedUtilPos = clampToPlot(plotArea, utilPos);
 
-        context.drawables.push({
-            kind: "text",
-            id: "utility-eq",
-            pos: clampedUtilPos,
-            text:"U(x,y) = x^a y^(1-a),  a=" + formatNum(params.a),
-            spans: buildUtilitySpans(params.a, fontSize),
-            fontSize: fontSize,
-            fill: { color: context.controlOptions.indiffColor },
-            draggable: true,
-        });
-    }
+        let specIdx = 0;
+        while (specIdx < EQUATION_LABEL_SPECS.length) {
+            const spec = EQUATION_LABEL_SPECS[specIdx];
 
-    // ------------------------------------------------------------
-    //  appendBudgetEquationLabel
-    //  - 加入 budget equation label（若可找到 anchor）
-    //
-    //  Input：
-    //  - context.params.px/py/I
-    //  - fontSize
-    //
-    //  Output：
-    //  - push id="budget-eq" 的 text drawable
-    // ------------------------------------------------------------
-    private appendBudgetEquationLabel(context: BuildContext, fontSize: number): void {
-        const params = context.params;
+            const anchor = anchors[spec.key];
+            if (anchor) {
+                const rawPos = resolveLabelPos({
+                    labelKey: spec.key,
+                    anchor: anchor,
+                    defaultOffsetDx: spec.defaultOffset.offsetDx,
+                    defaultOffsetDy: spec.defaultOffset.offsetDy,
+                    dragOffsetByLabelKey: context.labelOffsets,
+                });
 
-        const budgetAnchor = findLabelAnchor(context.drawables, "budget-eq");
-        if (!budgetAnchor) {
-            return;
+                const clampedPos = clampToPlot(plotArea, rawPos);
+
+                context.drawables.push({
+                    kind: "text",
+                    id: spec.key,
+                    pos: clampedPos,
+                    text: spec.buildText(context),
+                    spans: spec.buildSpans(context, fontSize),
+                    fontSize: fontSize,
+                    fill: { color: spec.getFillColor(context) },
+                    draggable: true,
+                });
+            }
+
+            specIdx++;
         }
-
-        // const offsetsDxDy = this.toDxDyOffsets(context.labelOffsets);
-
-        const budgetPos = resolveLabelPos({
-            labelKey: "budget-eq",
-            anchor: budgetAnchor,
-            defaultOffsetDx: 10,
-            defaultOffsetDy: 10,
-            dragOffsetByLabelKey: context.labelOffsets,
-        });
-
-        const plotArea = this.getLabelPlotArea(context.plot);
-        const clampedBudgetPos = clampToPlot(plotArea, budgetPos);
-
-        context.drawables.push({
-            kind: "text",
-            id: "budget-eq",
-            pos: clampedBudgetPos,
-            text: formatNum(params.px) + "x + " + formatNum(params.py) + "y = " + formatNum(params.I),
-            spans: buildBudgetSpans(params.px, params.py, params.I, fontSize),
-            fontSize: fontSize,
-            fill: { color: context.controlOptions.budgetColor },
-            draggable: true,
-        });
     }
 
-
-
-    // ------------------------------------------------------------
-    //  appendIndiffEquationLabel
-    //
-    //  - 加入 indifference curve equation label（若可找到 anchor）
-    //
-    //  Input：
-    //  - context.econ.UtilityAtOptPoint（U0）
-    //  - context.params.a（a）
-    //  - fontSize
-    //
-    //  Output：
-    //  - push id="indiff-eq" 的 text drawable
-    // ------------------------------------------------------------
-    private appendIndiffEquationLabel(context: BuildContext, fontSize: number): void {
-        const params = context.params;
-        const U0 = context.econ.UtilityAtOptPoint;
-
-        const indiffAnchor = findLabelAnchor(context.drawables, "indiff-eq");
-        if (!indiffAnchor) {
-        return;
-        }
-
-        // const offsetsDxDy = this.toDxDyOffsets(context.labelOffsets);
-
-        const indiffPos = resolveLabelPos({
-            labelKey: "indiff-eq",
-            anchor: indiffAnchor,
-            defaultOffsetDx: 10,
-            defaultOffsetDy: -10,
-            dragOffsetByLabelKey: context.labelOffsets,
-        });
-
-        const plotArea = this.getLabelPlotArea(context.plot);
-        const clampedIndiffPos = clampToPlot(plotArea, indiffPos);
-
-        context.drawables.push({
-            kind: "text",
-            id: "indiff-eq",
-            pos: clampedIndiffPos,
-            text: "y = (U0 / x^a)^(1/(1-a)),  U0=" + formatNum(U0),
-            spans: buildIndiffSpans(U0, params.a, fontSize),
-            fontSize: fontSize,
-            fill: { color: context.controlOptions.indiffColor },
-            draggable: true,
-        });
-    }
-
+    
     // ------------------------------------------------------------
     //  syncOptLabelPosition
     //  - 若 showOpt 為 true，讓 opt-label 每次 build 時重新依 anchor + offsets 決定位置
@@ -787,17 +864,19 @@ export class ConsumerOptSceneBuilder {
     //  Output：
     //  - 更新 drawables 中 id="opt-label" 的 pos
     // ------------------------------------------------------------
-    private syncOptLabelPosition(context: BuildContext): void {
+    private syncOptLabelPosition(
+        context: BuildContext,
+        anchors: Partial<Record<LabelKey, PixelPoint>>,
+    ): void {
         if (!context.controlOptions.showOpt) {
             return;
         }
 
-        const optAnchor = findLabelAnchor(context.drawables, "opt-label");
+        // const optAnchor = findLabelAnchor(context.drawables, "opt-label");
+        const optAnchor = anchors["opt-label"];
         if (!optAnchor) {
             return;
         }
-
-        // const offsetsDxDy = this.toDxDyOffsets(context.labelOffsets);
 
         const optPos = resolveLabelPos({
             labelKey: "opt-label",
@@ -825,8 +904,6 @@ export class ConsumerOptSceneBuilder {
 
         // immutable update，避免 (drawable as any).pos
         context.drawables = this.updateTextPosById(context.drawables, "opt-label", clampedOptPos);
-
-
     }
 
 
@@ -867,31 +944,31 @@ export class ConsumerOptSceneBuilder {
     }
 
     // ============================================================
-    // [NEW] Helper: updateTextPosById (pure function)
+    // Helper: updateTextPosById (pure function)
     // - 不用 any
     // - 不改原陣列、不改原物件
     // - 找到指定 id 的 text drawable 就回傳「帶新 pos 的新物件」
     // ============================================================
     private updateTextPosById(drawables: Drawable[], targetId: string, nextPos: PixelPoint): Drawable[] {
-    const updated: Drawable[] = [];
+        const updated: Drawable[] = [];
 
-    let drawableIdx = 0;
-    while (drawableIdx < drawables.length) {
-        const drawable = drawables[drawableIdx];
+        let drawableIdx = 0;
+        while (drawableIdx < drawables.length) {
+            const drawable = drawables[drawableIdx];
 
-        if (drawable.kind === "text" && drawable.id === targetId) {
-        // [FIX] 這裡已經被 narrowing 成 text drawable，TS 允許安全覆蓋 pos
-        updated.push({
-            ...drawable,
-            pos: nextPos,
-        });
-        } else {
-        updated.push(drawable);
+            if (drawable.kind === "text" && drawable.id === targetId) {
+            // 這裡已經被 narrowing 成 text drawable，TS 允許安全覆蓋 pos
+            updated.push({
+                ...drawable,
+                pos: nextPos,
+            });
+            } else {
+            updated.push(drawable);
+            }
+
+            drawableIdx++;
         }
-
-        drawableIdx++;
-    }
-    return updated;
+        return updated;
     }
 
 
