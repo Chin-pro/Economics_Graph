@@ -773,17 +773,17 @@ export class ConsumerOptSceneBuilder {
         
         const plotArea = this.getLabelPlotArea(context.plot);
 
-        // opt-label 初始位置: 也進行 clamp，避免一開始就出界
-        const optAnchor: PixelPoint = {
-            x: optPointPixel.x + OPT_LABEL_NUDGE.offsetDx,
-            y: optPointPixel.y + OPT_LABEL_NUDGE.offsetDy,
-        }
+        // // opt-label 初始位置: 也進行 clamp，避免一開始就出界
+        // const optAnchor: PixelPoint = {
+        //     x: optPointPixel.x + OPT_LABEL_NUDGE.offsetDx,
+        //     y: optPointPixel.y + OPT_LABEL_NUDGE.offsetDy,
+        // }
 
         const rawOptLabelPos = resolveLabelPos({
             labelKey: "opt-label",
-            anchor: optAnchor,
-            defaultOffsetDx: 0,
-            defaultOffsetDy: 0,
+            anchor: optPointPixel,
+            defaultOffsetDx: OPT_LABEL_NUDGE.offsetDx,
+            defaultOffsetDy: OPT_LABEL_NUDGE.offsetDy,
             dragOffsetByLabelKey: context.labelOffsets,
         });
 
@@ -792,7 +792,6 @@ export class ConsumerOptSceneBuilder {
         context.drawables.push({
             kind: "text",
             id: "opt-label",
-            // pos: { x: optPointPixel.x + OPT_LABEL_DX, y: optPointPixel.y + OPT_LABEL_DY },
             pos: clampedOptLabelPixel,
             text: "Opt",
             fontSize: 12,
@@ -848,64 +847,11 @@ export class ConsumerOptSceneBuilder {
 
             specIdx++;
         }
+
+        console.log("[plotArea]", plotArea);
+        console.log("[indiffOffset]", context.labelOffsets["indiff-eq"]);
+
     }
-
-    
-    // ------------------------------------------------------------
-    //  syncOptLabelPosition
-    //  - 若 showOpt 為 true，讓 opt-label 每次 build 時重新依 anchor + offsets 決定位置
-    //  - 避免 opt 點移動（參數改變）後，label 還停在舊位置
-    //
-    //  Input：
-    //  - context.controlOptions.showOpt
-    //  - context.drawables（必須包含 opt-label 才會更新）
-    //  - context.labelOffsets（offsetDx/offsetDy）
-    //
-    //  Output：
-    //  - 更新 drawables 中 id="opt-label" 的 pos
-    // ------------------------------------------------------------
-    private syncOptLabelPosition(
-        context: BuildContext,
-        anchors: Partial<Record<LabelKey, PixelPoint>>,
-    ): void {
-        if (!context.controlOptions.showOpt) {
-            return;
-        }
-
-        // const optAnchor = findLabelAnchor(context.drawables, "opt-label");
-        const optAnchor = anchors["opt-label"];
-        if (!optAnchor) {
-            return;
-        }
-
-        const optPos = resolveLabelPos({
-            labelKey: "opt-label",
-            anchor: optAnchor,
-            defaultOffsetDx: 0,
-            defaultOffsetDy: 0,
-            dragOffsetByLabelKey: context.labelOffsets,
-        });
-
-        const plotArea = this.getLabelPlotArea(context.plot);
-        const clampedOptPos = clampToPlot(plotArea, optPos);
-
-        // // 掃描 drawables，找到 opt-label text 並更新 pos
-        // let drawableIdx = 0;
-        // while (drawableIdx < context.drawables.length) {
-        //     const drawable = context.drawables[drawableIdx];
-
-        //     if (drawable.kind === "text" && drawable.id === "opt-label") {
-        //         // 直接覆蓋 pos（不改其他屬性）
-        //         // 若你的 Drawable.Text 型別是 readonly 或 union 寫入受限，這裡用 any 做型別逃逸
-        //         (drawable as any).pos = clampedOptPos;
-        //     }
-        //     drawableIdx++;
-        // }
-
-        // immutable update，避免 (drawable as any).pos
-        context.drawables = this.updateTextPosById(context.drawables, "opt-label", clampedOptPos);
-    }
-
 
     // ------------------------------------------------------------
     //  finalize
@@ -943,34 +889,89 @@ export class ConsumerOptSceneBuilder {
         };
     }
 
-    // ============================================================
-    // Helper: updateTextPosById (pure function)
-    // - 不用 any
-    // - 不改原陣列、不改原物件
-    // - 找到指定 id 的 text drawable 就回傳「帶新 pos 的新物件」
-    // ============================================================
-    private updateTextPosById(drawables: Drawable[], targetId: string, nextPos: PixelPoint): Drawable[] {
-        const updated: Drawable[] = [];
+    
+    // // ------------------------------------------------------------
+    // //  syncOptLabelPosition
+    // //  - 若 showOpt 為 true，讓 opt-label 每次 build 時重新依 anchor + offsets 決定位置
+    // //  - 避免 opt 點移動（參數改變）後，label 還停在舊位置
+    // //
+    // //  Input：
+    // //  - context.controlOptions.showOpt
+    // //  - context.drawables（必須包含 opt-label 才會更新）
+    // //  - context.labelOffsets（offsetDx/offsetDy）
+    // //
+    // //  Output：
+    // //  - 更新 drawables 中 id="opt-label" 的 pos
+    // // ------------------------------------------------------------
+    // private syncOptLabelPosition(
+    //     context: BuildContext,
+    //     anchors: Partial<Record<LabelKey, PixelPoint>>,
+    // ): void {
+    //     if (!context.controlOptions.showOpt) {
+    //         return;
+    //     }
 
-        let drawableIdx = 0;
-        while (drawableIdx < drawables.length) {
-            const drawable = drawables[drawableIdx];
+    //     // const optAnchor = findLabelAnchor(context.drawables, "opt-label");
+    //     const optAnchor = anchors["opt-label"];
+    //     if (!optAnchor) {
+    //         return;
+    //     }
 
-            if (drawable.kind === "text" && drawable.id === targetId) {
-            // 這裡已經被 narrowing 成 text drawable，TS 允許安全覆蓋 pos
-            updated.push({
-                ...drawable,
-                pos: nextPos,
-            });
-            } else {
-            updated.push(drawable);
-            }
+    //     const optPos = resolveLabelPos({
+    //         labelKey: "opt-label",
+    //         anchor: optAnchor,
+    //         defaultOffsetDx: 0,
+    //         defaultOffsetDy: 0,
+    //         dragOffsetByLabelKey: context.labelOffsets,
+    //     });
 
-            drawableIdx++;
-        }
-        return updated;
-    }
+    //     const plotArea = this.getLabelPlotArea(context.plot);
+    //     const clampedOptPos = clampToPlot(plotArea, optPos);
 
+    //     // // 掃描 drawables，找到 opt-label text 並更新 pos
+    //     // let drawableIdx = 0;
+    //     // while (drawableIdx < context.drawables.length) {
+    //     //     const drawable = context.drawables[drawableIdx];
+
+    //     //     if (drawable.kind === "text" && drawable.id === "opt-label") {
+    //     //         // 直接覆蓋 pos（不改其他屬性）
+    //     //         // 若你的 Drawable.Text 型別是 readonly 或 union 寫入受限，這裡用 any 做型別逃逸
+    //     //         (drawable as any).pos = clampedOptPos;
+    //     //     }
+    //     //     drawableIdx++;
+    //     // }
+
+    //     // immutable update，避免 (drawable as any).pos
+    //     context.drawables = this.updateTextPosById(context.drawables, "opt-label", clampedOptPos);
+    // }
+
+    // // ============================================================
+    // // Helper: updateTextPosById (pure function)
+    // // - 不用 any
+    // // - 不改原陣列、不改原物件
+    // // - 找到指定 id 的 text drawable 就回傳「帶新 pos 的新物件」
+    // // ============================================================
+    // private updateTextPosById(drawables: Drawable[], targetId: string, nextPos: PixelPoint): Drawable[] {
+    //     const updated: Drawable[] = [];
+
+    //     let drawableIdx = 0;
+    //     while (drawableIdx < drawables.length) {
+    //         const drawable = drawables[drawableIdx];
+
+    //         if (drawable.kind === "text" && drawable.id === targetId) {
+    //         // 這裡已經被 narrowing 成 text drawable，TS 允許安全覆蓋 pos
+    //         updated.push({
+    //             ...drawable,
+    //             pos: nextPos,
+    //         });
+    //         } else {
+    //         updated.push(drawable);
+    //         }
+
+    //         drawableIdx++;
+    //     }
+    //     return updated;
+    // }
 
 }
 

@@ -109,16 +109,55 @@ export function buildFixedEquationAnchors(
 //  - padding 讓 UI 更像正式圖表（期刊/投影片常見留白）
 // ------------------------------------------------------------
 export function clampToPlot(area: PlotArea, position: PixelPoint): PixelPoint {
-    // 計算合法範圍 (確保 min <= max 且落在 [0, width] / [0, height])
-    const rawMinX = area.padding;
-    const rawMaxX = area.width - area.padding;
-    const minX = Math.max(0, Math.min(rawMinX, rawMaxX));
-    const maxX = Math.min(area.width, Math.max(rawMinX, rawMaxX));
+    // ✅ [MOD] sanitize width/height
+    // ✅ [WHY] 畫布尺寸若為 NaN/Infinity/負數，原本的 min/max 推導會出現 max < min，最後 clamp 出負座標
+    let safeWidth = area.width;
+    let safeHeight = area.height;
 
-    const rawMinY = area.padding;
-    const rawMaxY = area.height - area.padding;
-    const minY = Math.max(0, Math.min(rawMinY, rawMaxY));
-    const maxY = Math.min(area.height, Math.max(rawMinY, rawMaxY));
+    if (!Number.isFinite(safeWidth)) {
+        safeWidth = 0;
+    }
+    if (!Number.isFinite(safeHeight)) {
+        safeHeight = 0;
+    }
+    if (safeWidth < 0) {
+        safeWidth = 0;
+    }
+    if (safeHeight < 0) {
+        safeHeight = 0;
+    }
+
+    // ✅ [MOD] compute bounds first, then normalize if max < min
+    // ✅ [WHY] 若 padding 太大導致 max < min，直接降級為全域範圍（0..size），避免輸出負數
+    let minX = area.padding;
+    let maxX = safeWidth - area.padding;
+
+    if (!Number.isFinite(minX)) {
+        minX = 0;
+    }
+    if (!Number.isFinite(maxX)) {
+        maxX = safeWidth;
+    }
+
+    if (maxX < minX) {
+        minX = 0;
+        maxX = safeWidth;
+    }
+
+    let minY = area.padding;
+    let maxY = safeHeight - area.padding;
+
+    if (!Number.isFinite(minY)) {
+        minY = 0;
+    }
+    if (!Number.isFinite(maxY)) {
+        maxY = safeHeight;
+    }
+
+    if (maxY < minY) {
+        minY = 0;
+        maxY = safeHeight;
+    }
     
     let clampedX = position.x;    // pixelX
     let clampedY = position.y;    // pixelY
@@ -394,8 +433,10 @@ function collectOptLabelAnchorFromOptPoint(
   }
 
   anchorState["opt-label"] = {
-    x: drawable.center.x + OPT_LABEL_NUDGE.offsetDx,
-    y: drawable.center.y + OPT_LABEL_NUDGE.offsetDy,
+    // x: drawable.center.x + OPT_LABEL_NUDGE.offsetDx,
+    // y: drawable.center.y + OPT_LABEL_NUDGE.offsetDy,
+    x: drawable.center.x,
+    y: drawable.center.y,
   };
 }
 
