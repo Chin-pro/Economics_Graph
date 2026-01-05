@@ -69,7 +69,7 @@ export class ConsumerOptController {
 
     // options：屬於「視覺」而不是「經濟模型」的狀態
     // 放在 controller 讓 UI（控制欄）改它時，能統一驗證並重建 scene
-    private options: ConsumerViewOptions;  //  budgetColor/indiffColor
+    private controlViewOptions: ConsumerViewOptions;  //  budgetColor/indiffColor
 
     // labelOffsets：只存偏移，不摻雜 buildScene
     // labelOffsets：記錄「使用者拖曳 label 後，相對於 anchor 的偏移量」。
@@ -114,7 +114,7 @@ export class ConsumerOptController {
         
         // options 的預設值
         // - 影響 scene 的 drawables（是否畫 label / 顏色 / 字體大小等渲染用參數）
-        this.options = {
+        this.controlViewOptions = {
             showEquationLabels: true,
             labelFontSize: 12,
 
@@ -192,133 +192,153 @@ export class ConsumerOptController {
     //  Output: SceneOutput
     // ------------------------------------------------------------
     getScene(): SceneOutput {
-    //   // 若快取存在，直接回傳（避免重建）
+    //   // cache hit: 若快取存在，直接回傳（避免重建）
     //   if (this.lastScene) {
     //     return this.lastScene;
     //   }
 
-    //   // 沒快取 → 新建一次
+    //   // cache miss: 新建一次 cache: build.scene
     //   this.rebuildCache();
-
-    //   // 防禦式寫法：
-    //   // - 理論上 rebuildCache 一定會填 lastScene
-    //   // - 若如果未來 builder 失敗回傳空值，這裡至少再嘗試一次
-    //   // 這樣不會沒完沒了???
-    //   if (!this.lastScene) {
-    //     // 理論上不會發生，保險
-    //     this.rebuildCache();
-    //   }
 
     //   // TS 在這裡仍可能推不出 lastScene 不為 null，
     //   // 所以你用 `as SceneOutput` 告訴 TS：「我保證這裡不是 null」。
     //   return this.lastScene as SceneOutput;
 
+        // cache hit: 若快取存在，直接回傳（避免重建）
         if (this.lastScene !== null) {
             return this.lastScene;
         }
 
+        // cache miss: 新建一次 cache: build.scene
         this.rebuildCache();
 
+        // 防禦式寫法：理論上不會發生，保險
+        // - 理論上 rebuildCache 一定會填 lastScene
+        // - 若如果未來 builder 失敗回傳空值，這裡至少再嘗試一次
+        if (!this.lastScene) {
+            this.rebuildCache();
+        }
+
+        // 重試後，依然為空，則直接報錯
         if (this.lastScene === null) {
-            // 這裡直接 fail fast，比「再 rebuild 一次」更合理
+            // 直接 fail fast，比「再 rebuild 一次」更合理
             throw new Error("[ConsumerOptController] rebuildCache() did not produce a SceneOutput.");
         }
 
         return this.lastScene;
     }
 
-    // ✅ [EXPLAIN] getViewport
-    // input: none
-    // output: Viewport
-    // 作用：取得目前 viewport（若快取存在就回傳；否則 build 一次）
-    getViewport(): Viewport {
-      if (this.lastViewport) {
-        return this.lastViewport;
-      }
-
-      this.rebuildCache();
-
-      if (!this.lastViewport) {
-        // 保險
-        // ✅ [EXPLAIN]
-        // 這裡建立一個「最小可用」的 viewport，避免外部呼叫時直接炸掉。
-        // (1,1,[0,1],[0,1]) 是一個 fallback（但確實屬於 magic-ish 的防禦值）。
-        this.lastViewport = new Viewport(1, 1, [0, 1], [0, 1]);
-      }
-      return this.lastViewport;
-    }
-
-    // ✅ [EXPLAIN] getModelParamsSnapshot
-    // input: none
-    // output: (由 model.getModelParams() 決定的型別，通常是一個 params object)
-    // 作用：提供 UI 顯示或 debug 用的「當前 model 參數快照」
-    getModelParamsSnapshot() {
-      return this.model.getModelParams();
-    }
-
-    // ---------------------------
-    // ✅ [REFAC] options setters（集中驗證）
-    // ---------------------------
-
-    // ✅ [EXPLAIN] setViewOptions
-    // input: patch: Partial<ConsumerViewOptions>
-    // output: void
+    // ------------------------------------------------------------
+    //  getViewport  ??? 重建調整 rebuildCache() 的架構，目前只回傳 built.scene??????????
+    //  - 作用：取得目前 viewport（若快取存在就回傳；否則 build 一次）
+    //  
+    //  Input: none
     //
-    // Partial<T> 是 TS 的 utility type：
-    // - 表示「T 的所有欄位都變成可選」
-    // - 用途：讓外部只更新部分 options（例如只改 showOpt 或只改 fontSize）
+    //  Output: Viewport
+    // ------------------------------------------------------------
+    getViewport(): Viewport {
+        // cache hit: 檢查 cache (快取)
+        if (this.lastViewport) {
+            return this.lastViewport;
+        }
+
+        // cache miss: 重建 scene
+        this.rebuildCache();
+
+        // Defensive Programming: 若重建回傳空值，再次嘗試一次
+        if (!this.lastViewport) {
+            // 這裡建立一個「最小可用」的 viewport，避免外部呼叫時直接炸掉。
+            // (1,1,[0,1],[0,1]) 是一個 fallback（但確實屬於 magic-ish 的防禦值）。
+            // ??? 應該回傳 Viewport 的預設值??? 需要把 Viewport中的 magic nubmer 導入
+            this.lastViewport = new Viewport(1, 1, [0, 1], [0, 1]);
+        }
+        return this.lastViewport;
+    }
+
+    // ------------------------------------------------------------
+    //  getModelParamsSnapshot
+    //  - 作用：提供 UI 顯示或 debug 用的「當前 model 參數快照」
+    //
+    //  Input: none
+    //  Output: (由 model.getModelParams() 決定的型別，通常是一個 params object)
+    // ------------------------------------------------------------
+    getModelParamsSnapshot() {
+         return this.model.getModelParams();
+    }
+
+
+    // ============================================================
+    //  options setters（集中驗證）
+    // ============================================================
+
+    // ------------------------------------------------------------
+    //  setViewOptions
+    //  Partial<T> 是 TS 的 utility type：
+    //  - 表示「T 的所有欄位都變成可選」
+    //  - 用途：讓外部只更新部分 options（例如只改 showOpt 或只改 fontSize）
+    //
+    //  Input: patch: Partial<ConsumerViewOptions>  ????? path 是甚麼?
+    //  Output: void    
+    // ------------------------------------------------------------
     setViewOptions(patch: Partial<ConsumerViewOptions>) {
-      // ✅ 產生 next options（immutable update）
-      // ✅ [EXPLAIN]
+      // 產生 next options（immutable update），避免直接 mutate this.options (汙染)
       // `{ ...this.options, ...patch }`：
       // - 先展開舊 options
       // - 再展開 patch 覆蓋同名欄位
-      // 這是常見的「狀態更新」寫法，避免直接 mutate this.options。
-      const next: ConsumerViewOptions = { ...this.options, ...patch };
+      const nextConsumerViewOption: ConsumerViewOptions = { ...this.controlViewOptions, ...patch };
 
-      // 防呆：字體大小範圍
-      // ✅ [EXPLAIN]
-      // 集中驗證的好處：所有 UI 設定改動都會通過同一個入口，
-      // 不會散落在各個 onChange handler 裡。
-      if (next.labelFontSize < 8) {
-        next.labelFontSize = 8;
+      // 防呆機制：字體大小範圍
+      // - 集中驗證：所有 UI 設定改動都會通過同一個入口，避免散落在各個 onChange handler 裡
+      if (nextConsumerViewOption.labelFontSize < 8) {
+        nextConsumerViewOption.labelFontSize = 8;
       }
-      if (next.labelFontSize > 28) {
-        next.labelFontSize = 28;
+      if (nextConsumerViewOption.labelFontSize > 28) {
+        nextConsumerViewOption.labelFontSize = 28;
       }
 
-      // ✅ 更新 options 並重建 scene 通知 view
-      this.options = next;
+      // 更新 options 並重建 scene 通知 view
+      this.controlViewOptions = nextConsumerViewOption;  // 型別皆為 (type) ConsumerViewOptions
       this.rebuildAndNotify();
     }
 
-    // ---------------------------
-    // slider events
-    // ---------------------------
 
-    // ✅ [EXPLAIN] onIncomeChange
-    // input: nextI（新的 income 數值）
-    // output: void
-    // 作用：把 income 寫回 model，然後 rebuild scene
-    onIncomeChange(nextI: number) {
-      this.model.setIncome(nextI);
+    // ============================================================
+    //  slider events
+    // ============================================================
+
+    // ------------------------------------------------------------
+    //  onIncomeChange
+    //  - 作用：把 income 寫回 model，然後 rebuild scene
+    //
+    //  Input: nextIncome（新的 income 數值）
+    //
+    //  Output: void
+    // ------------------------------------------------------------
+    onIncomeChange(nextIncome: number) {
+      this.model.setIncome(nextIncome);
       this.rebuildAndNotify();
     }
 
-    // ✅ [EXPLAIN] onAlphaChange
-    // input: nextA（新的 alpha 效用權重）
-    // output: void
+    // ------------------------------------------------------------
+    //  onAlphaChange
+    //
+    //  Input: nextA（新的 alpha 效用權重）
+    //
+    //  Output: void
+    // ------------------------------------------------------------
     onAlphaChange(nextAlpha: number) {
-      this.model.setAlpha(nextAlpha);
-      this.rebuildAndNotify();
+        this.model.setAlpha(nextAlpha);
+        this.rebuildAndNotify();
     }
 
+    // ------------------------------------------------------------
     // ✅ [EXPLAIN] onPxChange
     // input: nextPx（新的 px）
     // output: void
     //
     // 你這裡做了最小值限制 px >= 0.1
-    // 原因：避免 px 太小導致 budget 線斜率爆炸/數值不穩，或除以 0。
+    // 原因：避免 px 太小導致 budget 線斜率爆炸/數值不穩，或除以 0
+    // ------------------------------------------------------------
     onPxChange(nextPx: number) {
       const params = this.model.getModelParams();
 
@@ -364,7 +384,7 @@ export class ConsumerOptController {
       // Opt 關閉就不允許拖
       // ✅ [EXPLAIN]
       // 這是「UI option gate」：不顯示就不允許互動，避免狀態和畫面不一致。
-      if (!this.options.showOpt) {
+      if (!this.controlViewOptions.showOpt) {
         return;
       }
 
@@ -462,7 +482,7 @@ export class ConsumerOptController {
         // - options：渲染控制（顯示哪些元素、字體大小、顏色等）
         // - labelOffsets：文字的相對偏移（由拖曳累積出來）
         const built = this.builder.buildScene({
-            controlOptions: this.options,
+            controlOptions: this.controlViewOptions,
             labelOffsets: this.labelOffsets,
         });
 
