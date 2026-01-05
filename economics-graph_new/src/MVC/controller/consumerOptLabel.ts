@@ -392,32 +392,6 @@ function collectBudgetEqAnchorFromBudgetLine(
   anchorState["budget-eq"] = { x: xMiddle, y: yMiddle };
 }
 
-// // ------------------------------------------------------------
-// // collectIndiffEqAnchorFromIndiffPolyline (private)
-// // - 若遇到 indiff polyline（id === "indiff"），收集中間點作為 indiff-eq anchor
-// // ------------------------------------------------------------
-// function collectIndiffEqAnchorFromIndiffPolyline(
-//     drawable: PolylineDrawable, 
-//     anchorState: LabelAnchorState
-// ): void {
-//   if (anchorState["indiff-eq"]) {
-//     return;
-//   }
-//   if (drawable.id !== "indiff") {
-//     return;
-//   }
-
-//   const pointCount = drawable.points.length;
-//   if (pointCount <= 0) {
-//     return;
-//   }
-
-//   const midIndex = Math.floor(pointCount / 2);
-//   const midPoint = drawable.points[midIndex];
-
-//   anchorState["indiff-eq"] = { x: midPoint.x, y: midPoint.y };
-// }
-
 // ------------------------------------------------------------
 // collectOptLabelAnchorFromOptPoint (private)
 // - 若遇到 opt point（id === "opt"），收集「點中心 + nudge」作為 opt-label anchor
