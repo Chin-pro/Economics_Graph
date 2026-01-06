@@ -2,7 +2,8 @@
 
 // ------------------------------------------------------------
 //  Label anchor / offset / clamp
-//  SRP：把「可拖曳標籤」的幾何規則獨立出來
+//  - 把「可拖曳標籤」的幾何規則獨立出來
+//  
 // ------------------------------------------------------------
 
 import type { 
@@ -41,10 +42,39 @@ export type PixelPoint = Point2D;
 export type PixelOffset = { offsetDx: number; offsetDy: number };
 
 
-// labelKey 以 union type 表示
-//  - [Update] 新增 new label，需要在這裡添加
-export type LabelKey = "budget-eq" | "indiff-eq" | "opt-label" | "utility-eq";
+// ------------------------------------------------------------
+//  LABEL_KEYS: LabelKey 的 single source of truth
+//  - 新增 label 只需要改這個陣列，不需要到處修改 union/guard/set
+// ------------------------------------------------------------
+export const LABEL_KEYS = [
+  "budget-eq",
+  "indiff-eq",
+  "opt-label",
+  "utility-eq",
+] as const;
 
+// ------------------------------------------------------------
+//  LabelKey
+//  - 由 LABEL_KEYS 推導
+//  - 避免 union type 手動維護造成不同步
+// ------------------------------------------------------------
+export type LabelKey = (typeof LABEL_KEYS)[number];
+
+// ------------------------------------------------------------
+//  LABEL_KEY_SET
+//  - 提供集中管理的 Set + type guard
+//  - Controller 不應該在維護一份 key 清單與檢查邏輯
+// ------------------------------------------------------------
+const LABEL_KEY_SET: ReadonlySet<string> = new Set(LABEL_KEYS);
+
+// ------------------------------------------------------------
+//  isLabelKey
+//  - 確認 id:string 是否存在於 LABEL_KEY 表中
+//  - Set.has 是 runtime 檢查；回傳型別透過 type predicate 提供 TS narrowing
+// ------------------------------------------------------------
+export function isLabelKey(id: string): id is LabelKey {
+    return LABEL_KEY_SET.has(id);
+}
 
 // opt label 文字相對 opt 點的視覺偏移 (避免文字壓到點，造成難以點擊)
 export const OPT_LABEL_NUDGE: PixelOffset = { offsetDx: 8, offsetDy: -8 };  // 往右 (dx: +8)，往上 (dy: -8)
@@ -59,10 +89,9 @@ const UTILITY_FIXED_ANCHOR: PixelPoint = {
   y: UTILITY_ANCHOR_PADDING_Y,
 };
 
-// 排版用的「行高倍率」常數（不是座標 magic number）
+// 排版用的「行高倍率」
 // - indiff-eq 需要一個「穩定 anchor」：
-//          我們用 fontSize 推導行距（語義是排版規則，不是拍腦袋座標）
-//          這比使用 0.58/0.18 之類的「神秘比例座標」更可解釋、可維護。
+//   用 fontSize 推導行距（語義是排版規則，不是拍腦袋座標）
 export const LABEL_LINE_HEIGHT_RATIO = 1.4;
 
 // 提供「固定方程式標籤」的 anchors（由 fontSize 推導排版）
@@ -97,20 +126,21 @@ export function buildFixedEquationAnchors(
 //  - 避免 label 被拖曳到畫布外，造成看不到/點不到/拖不回來的 UX bug
 //
 //  Input：
-//  - pixelX / pixelY：想要顯示的位置（像素）
+//  - plotArea (width/height/padding)
 //  - plotWidth / plotHeight：繪圖區大小（像素）
-//  - plotPaddingPx：邊界留白（像素），避免文字貼邊或被裁切
+//  - padding：邊界留白（像素），避免文字貼邊或被裁切
+//  - pixelX / pixelY：想要顯示的位置（像素）
 //
 //  Output：
-//  - 回傳修正後的位置 { pixelX, pixelY }（一定在可視/可點擊範圍內）
+//  - 回傳修正後的位置 PixelPoint: { pixelX, pixelY }（一定在可視/可點擊範圍內）
 //
 //  設計邏輯：
 //  - 純函式（pure function）：不依賴外部狀態，易測試、易重用
 //  - padding 讓 UI 更像正式圖表（期刊/投影片常見留白）
 // ------------------------------------------------------------
 export function clampToPlot(area: PlotArea, position: PixelPoint): PixelPoint {
-    // ✅ [MOD] sanitize width/height
-    // ✅ [WHY] 畫布尺寸若為 NaN/Infinity/負數，原本的 min/max 推導會出現 max < min，最後 clamp 出負座標
+    // sanitize width/height
+    // 畫布尺寸若為 NaN/Infinity/負數，原本的 min/max 推導會出現 max < min，最後 clamp 出負座標
     let safeWidth = area.width;
     let safeHeight = area.height;
 
@@ -127,8 +157,8 @@ export function clampToPlot(area: PlotArea, position: PixelPoint): PixelPoint {
         safeHeight = 0;
     }
 
-    // ✅ [MOD] compute bounds first, then normalize if max < min
-    // ✅ [WHY] 若 padding 太大導致 max < min，直接降級為全域範圍（0..size），避免輸出負數
+    // compute bounds first, then normalize if max < min
+    // 若 padding 太大導致 max < min，直接降級為全域範圍（0..size），避免輸出負數
     let minX = area.padding;
     let maxX = safeWidth - area.padding;
 
@@ -186,7 +216,9 @@ export function clampToPlot(area: PlotArea, position: PixelPoint): PixelPoint {
         clampedY = maxY;
     }
 
-    return { x: clampedX, y: clampedY };  // { pixelX, pixelY }
+    // const clampedPixelPoint: PixelPoint = { x: clampedX, y: clampedY };
+
+    return { x: clampedX, y: clampedY };    // { pixelX, pixelY }
 }
 
 
@@ -257,9 +289,9 @@ export function resolveLabelPos(args: {
 };
 
 
-// ============================================================
+// ------------------------------------------------------------
 //  findLabelAnchorsOnePass (Public API)
-//  - 一次掃描 drawables，就把所有 labelKey 的 anchor 都算出來
+//  - 一次掃描 drawables，收集「需要貼著圖形」的 label anchor (Ex: budget-eq / opt-label)
 //
 //  - 原本是每次 findLabelAnchor(labelKey) 都掃一次 drawables（linear search）
 //  - 目前圖元少沒差，但 AE LMS 未來：
@@ -267,45 +299,13 @@ export function resolveLabelPos(args: {
 //    - drawables 會變多
 //    - 多次 linear scan 會累積成本
 //
-//  Output：
+//  Input:
+//  - drawables: Drawable[]
+//
+//  Output:
 //  - Partial<Record<LabelKey, PixelPoint>>
 //  - 找不到就沒有該 key（不放進 object）
-// ============================================================
-
 // ------------------------------------------------------------
-//  AnchorState：直接以 LabelKey 為 key（避免再做 mapping/轉換）
-// ------------------------------------------------------------
-type LabelAnchorState = Partial<Record<LabelKey, PixelPoint>>;
-
-// ------------------------------------------------------------
-//  AnchorHandlersByDrawableKind (private)
-//  - 依 drawable.kind 分桶，再以 drawable.id 查 handler
-//  - 新增規則只要加 handler，不需要讓 while 迴圈 if-else 越疊越深
-// ------------------------------------------------------------
-type AnchorHandlersByDrawableKind = {
-  line: Record<string, (d: LineDrawable, state: LabelAnchorState) => void>;
-  polyline: Record<string, (d: PolylineDrawable, state: LabelAnchorState) => void>;
-  point: Record<string, (d: PointDrawable, state: LabelAnchorState) => void>;
-  text: Record<string, (d: TextDrawable, state: LabelAnchorState) => void>;
-  mathSvg: Record<string, (d: MathSvgDrawable, state: LabelAnchorState) => void>;
-};
-
-// ------------------------------------------------------------
-//  ANCHOR_HANDLERS_BY_DRAWABLE_KIND：規則表 (private)
-//  - 修改原因：一眼看懂是「依 kind 分桶的 handlers 表」
-// ------------------------------------------------------------
-const ANCHOR_HANDLERS_BY_DRAWABLE_KIND: AnchorHandlersByDrawableKind = {
-  line: {
-    budget: collectBudgetEqAnchorFromBudgetLine,
-  },
-  polyline: {},  // indiff-eq 現在是「固定註記」而非貼著曲線
-  point: {
-    opt: collectOptLabelAnchorFromOptPoint,
-  },
-  text: {},
-  mathSvg: {},
-};
-
 export function findLabelAnchorsOnePass(
     drawables: Drawable[]
 ): Partial<Record<LabelKey, PixelPoint>> {
@@ -370,31 +370,87 @@ export function findLabelAnchorsOnePass(
     return anchors;
 }
 
+// ------------------------------------------------------------
+//  AnchorState (private)
+//  - 直接以 LabelKey 為 key（避免再做 mapping/轉換）
+//
+//  - Record<LabelKey, PixelPoint>
+//    - 做一個物件 (map/dictionary)
+//      key: 只能是 LabelKey (Ex: "budget-eq" | "opt-label" | ...)
+//      value: 是 PixelPoint (Ex: { x: 120, y: 80 })
+// ------------------------------------------------------------
+type LabelAnchorState = Partial<Record<LabelKey, PixelPoint>>;
+
+// ------------------------------------------------------------
+//  AnchorHandlersByDrawableKind (private)
+//  - 依 drawable.kind 分桶，再以 drawable.id 查 handler
+//    因為不同 kind 的 drawable 型別不同、欄位不同
+//  - 新增規則只要加 handler，不需要讓 while 迴圈 if-else 越疊越深
+// ------------------------------------------------------------
+type AnchorHandlersByDrawableKind = {
+    // 預算線 budget line
+    line: Record<string, (drawableType: LineDrawable, state: LabelAnchorState) => void>;
+
+    // opt 點
+    polyline: Record<string, (drawableType: PolylineDrawable, state: LabelAnchorState) => void>;
+
+    // indiff curve
+    point: Record<string, (drawableType: PointDrawable, state: LabelAnchorState) => void>;
+
+    // 一般文字
+    text: Record<string, (drawableType: TextDrawable, state: LabelAnchorState) => void>;
+
+    // 公式 mathSvg
+    mathSvg: Record<string, (drawableType: MathSvgDrawable, state: LabelAnchorState) => void>;
+};
+
+// ------------------------------------------------------------
+//  ANCHOR_HANDLERS_BY_DRAWABLE_KIND：規則表 (private)
+//  - 修改原因：一眼看懂是「依 kind 分桶的 handlers 表」
+// ------------------------------------------------------------
+const ANCHOR_HANDLERS_BY_DRAWABLE_KIND: AnchorHandlersByDrawableKind = {
+  line: { budget: collectBudgetEqAnchorFromBudgetLine, },
+  polyline: {},  // indiff-eq 現在是「固定註記」而非貼著曲線
+  point: { opt: collectOptLabelAnchorFromOptPoint, },
+  text: {},
+  mathSvg: {},
+};
 
 // ------------------------------------------------------------
 // collectBudgetEqAnchorFromBudgetLine (private)
 // - 若遇到 budget line（id === "budget"），收集其中點作為 budget-eq anchor
+//
+// Input:
+// - drawable: LineDrawable, anchorState (收集容器)
+// Output:
+// - void (side effect: 寫入 anchorState)
 // ------------------------------------------------------------
 function collectBudgetEqAnchorFromBudgetLine(
     drawable: LineDrawable, 
     anchorState: LabelAnchorState
 ): void {
-  if (anchorState["budget-eq"]) {
-    return;
-  }
-  if (drawable.id !== "budget") {
-    return;
-  }
+    if (anchorState["budget-eq"]) {
+        return;
+    }
+    if (drawable.id !== "budget") {
+        return;
+    }
 
-  const xMiddle = (drawable.minEndPoint.x + drawable.maxEndPoint.x) / 2;
-  const yMiddle = (drawable.minEndPoint.y + drawable.maxEndPoint.y) / 2;
+    const xMiddle = (drawable.minEndPoint.x + drawable.maxEndPoint.x) / 2;
+    const yMiddle = (drawable.minEndPoint.y + drawable.maxEndPoint.y) / 2;
 
-  anchorState["budget-eq"] = { x: xMiddle, y: yMiddle };
+    anchorState["budget-eq"] = { x: xMiddle, y: yMiddle };
 }
 
 // ------------------------------------------------------------
 // collectOptLabelAnchorFromOptPoint (private)
 // - 若遇到 opt point（id === "opt"），收集「點中心 + nudge」作為 opt-label anchor
+//
+// Input:
+// - drawable: PointDrawable, anchorState
+//
+// Output:
+// - void (side effect)
 // ------------------------------------------------------------
 function collectOptLabelAnchorFromOptPoint(
     drawable: PointDrawable, 
@@ -413,146 +469,3 @@ function collectOptLabelAnchorFromOptPoint(
     y: drawable.center.y,
   };
 }
-
-
-
-
-// ============================================================
-//  Private Functions (internal)
-// ============================================================
-
-// // ------------------------------------------------------------
-// //  ANCHOR_RESOLVER_BY_LABEL
-// //  - 查表 (mapping) 索引: 集中「key → 規則」的關係
-// //  
-// //  Record<LabelKey, AnchorResolver>:
-// //  - 需要提供每一個 LabelKey 的 resolver
-// //  - 未來新增 LabelKey 時，但忘了添加 resolver，TS 會直接報錯
-// // ------------------------------------------------------------
-// const ANCHOR_RESOLVER_BY_LABEL: Record<LabelKey, AnchorResolver> = {
-//     "budget-eq": resolveBudgetEquationAnchor,
-//     "indiff-eq": resolveIndiffEquationAnchor,
-//     "opt-label": resolveOptLabelAnchor,
-//     "utility-eq": resolveUtilityEquationAnchor,
-// }
-
-// // ------------------------------------------------------------
-// // resolveBudgetEquationAnchor
-// // - 找到 budget line（id === "budget" 的 line drawable）
-// // - 回傳該線段的「中點」作為 budget-eq 的 anchor
-// //
-// // Input：drawables（所有圖元）
-// //
-// // Output：PixelPoint（中點）或 null（找不到）
-// //
-// // 設計邏輯：
-// // - 用 while 掃描：明確、可控，且符合你偏好不使用 break/continue
-// // - 找到第一條符合的線就 return（提前結束）
-// // ------------------------------------------------------------
-// function resolveBudgetEquationAnchor(drawables: Drawable[]): PixelPoint | null {
-//     let drawableIndex = 0;
-
-//     while (drawableIndex < drawables.length) {
-//         const drawable = drawables[drawableIndex];
-
-//         // drawable.kind === "line" 會觸發 TS 的「型別收斂」(narrowing)，收斂為 LineDrawable
-//         // 讓 TS 知道 drawable 具有 a/b 兩端點，可以安全讀取 drawable.a/drawable.b
-//         if (drawable.kind === "line" && drawable.id === "budget") {
-//             const middleX = (drawable.minEndPoint.x + drawable.maxEndPoint.x) / 2;
-//             const middleY = (drawable.minEndPoint.y + drawable.maxEndPoint.y) / 2;
-
-//             // 線段中點公式: 兩端點平均
-//             return { x: middleX, y: middleY };  // Point2D: { pixelX, pixelY }
-//         }
-//         drawableIndex++;
-//     }
-
-//     // 掃描整個陣列，若仍找不到，回傳 null
-//     return null;
-// }
-
-// // ------------------------------------------------------------
-// // resolveIndiffEquationAnchor
-// // - 找到 indiff polyline（id === "indiff"）
-// // - 回傳 polyline 的「中間點」作為 indiff-eq 的 anchor
-// //
-// // Input：drawables
-// // Output：PixelPoint 或 null
-// //
-// // 設計邏輯：
-// // - polyline 可能有很多點，用中間索引是一個成本低、效果好的近似
-// // - 若 points 為空，回 null（避免回傳莫名座標）
-// // ------------------------------------------------------------
-// function resolveIndiffEquationAnchor(drawables: Drawable[]): PixelPoint | null {
-//     let drawableIndex = 0;
-
-//     while (drawableIndex < drawables.length) {
-//         const drawable = drawables[drawableIndex];
-
-//         // kind === "polyline" 後，TS 知道 drawable 有 points 屬性
-//         if (drawable.kind === "polyline" && drawable.id === "indiff") {
-//             const pointCount = drawable.points.length;
-
-//             // 防呆機制: 沒有點 就沒有 anchor
-//             if (pointCount <= 0) {
-//                 return null;
-//             }
-
-//             // Math.floor: 將索引轉成整數 (陣列索引必須是整數)
-//             const middlePointIndex = Math.floor(pointCount / 2);
-
-//             const middlePoint = drawable.points[middlePointIndex];
-
-//             return { x: middlePoint.x, y: middlePoint.y };  // Point2D: { pixelX, pixelY }
-//         }
-//         drawableIndex++;
-//     }
-//     return null;
-// }
-
-// // ------------------------------------------------------------
-// // resolveOptLabelAnchor
-// // - 找到 opt point（id === "opt" 的 point drawable）
-// // - 回傳「點中心 + 視覺偏移」作為 opt-label 的 anchor
-// //
-// // Input：drawables
-// // Output：PixelPoint 或 null
-// //
-// // 設計邏輯：
-// // - 不直接回傳點中心，避免文字壓在點上
-// // - 使用 OPT_LABEL_NUDGE 集中管理偏移，未來調整方便
-// // ------------------------------------------------------------
-// function resolveOptLabelAnchor(drawables: Drawable[]): PixelPoint | null {
-//     let drawableIndex = 0;
-
-//     while (drawableIndex < drawables.length) {
-//         const drawable = drawables[drawableIndex];
-
-//         // kind === "point" 後，TS 知道 drawable 有 center 屬性
-//         if (drawable.kind === "point" && drawable.id === "opt") {
-//             return {
-//                 x: drawable.center.x + OPT_LABEL_NUDGE.offsetDx,
-//                 y: drawable.center.y + OPT_LABEL_NUDGE.offsetDy,
-//             };    // Point2D: { pixelX, pixelY }
-//         }
-//         drawableIndex++;
-//     }
-//     return null;
-// }
-
-// // ------------------------------------------------------------
-// // resolveUtilityEquationAnchor
-// // - utility-eq 是「整張圖的註記」，固定放左上角
-// //
-// // Input：drawables（但不需要用到）
-// // Output：固定 PixelPoint
-// //
-// // 設計邏輯：
-// // - 參數命名為 _drawables：表示刻意不使用，讓讀者/工具知道不是忘了用
-// // - 回傳常數 UTILITY_FIXED_ANCHOR，避免 magic number
-// // ------------------------------------------------------------
-// function resolveUtilityEquationAnchor(_drawables: Drawable[]): PixelPoint | null {
-//     return UTILITY_FIXED_ANCHOR;
-// }
-
-
