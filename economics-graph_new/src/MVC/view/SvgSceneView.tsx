@@ -530,8 +530,8 @@ export class SvgSceneView extends React.Component<Props> {
             const spanFont = s.fontSize !== undefined ? s.fontSize : undefined;
 
             // dx/dy 可用來精調，但一般不需要
-            const dx = s.dx !== undefined ? s.dx : undefined;
-            const dy = s.dy !== undefined ? s.dy : undefined;
+            const dx = s.offsetDx !== undefined ? s.offsetDx : undefined;
+            const dy = s.offsetDy !== undefined ? s.offsetDy : undefined;
 
             return (
               <tspan 

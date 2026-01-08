@@ -23,7 +23,20 @@
 // - SceneBuilder 不直接畫 SVG，只輸出「可畫的資料」
 // ------------------------------------------------------------
 
-import type { Drawable, SceneOutput, Point2D } from "../../core/drawables";
+// 用 DrawableInput + resolver 在 finalize 進行 strict 化
+import type { 
+    DrawableInput,     // strict drawable union (line/polyline/point/text/mathSvg)
+    SceneOutput,       // strict scene output
+    SceneOutput_Input, // resolver 的輸入型別
+    Point2D,           // Point2D/Vec2 alias (目前用於 econ/pixel point)
+    TextSpan,          // 給 EquationLabelSpec 的 buildSpans 型別
+    // StrokeStyle,       // strict StrokeStyle
+    // FillStyle,         // strict FillStyle
+} from "../../core/drawables";
+
+// resolver：把 SceneOutput_Input → SceneOutput（strict）
+// - 會補齊 stroke/fill/spans/textAnchor 等必填欄位
+import { resolveSceneOutput } from "../../core/drawables";
 
 // Viewport 是 runtime class (有 constructor/methods)，所以不用 type import
 // 在 econ domain (經濟座標) 與 pixel (畫布座標) 之間的映射
@@ -44,15 +57,14 @@ import { computePlotInnerSize } from "./consumerOptPlotSize";
 // - resolveLabelPos: 用 anchor + offsets 算出最後 label 的位置 (可拖曳後記住偏移)
 import { 
     clampToPlot, 
-    // findLabelAnchor, 
-    findLabelAnchorsOnePass,  // 改用一次掃描 anchors 的 API，避免每個 label 重複 linear scan
-    resolveLabelPos,
+    findLabelAnchorsOnePass,    // 一次掃描 anchors 的 API，避免每個 label 重複 linear scan
+    resolveLabelPos,            // anchor + defaultOffset + dragOffset → label pos
     buildFixedEquationAnchors,  // 取得「indiff-eq / utility-eq 的穩定 anchors」
-    type PlotArea,      // clamp 規則需要的最小環境參數
-    type PixelPoint,
-    type PixelOffset,
-    type LabelKey,
-    OPT_LABEL_NUDGE,    // single sourth of truth
+    type PlotArea,              // clamp 規則需要的最小環境參數
+    type PixelPoint,            // label 的像素點
+    type PixelOffset,           // label 的偏移量
+    type LabelKey,              // labey key union
+    OPT_LABEL_NUDGE,            // opt-label 的預設偏移 (single sourth of truth)
 } from "./consumerOptLabel";
 
 // buildBudgetSpans / buildIndiffSpans / buildUtilitySpans:
@@ -66,9 +78,9 @@ import {
 
 
 // ============================================================
-// magic number
-// - 這些常數全部只影響「內部計算與預設值」
-// - 不影響外部 build() 的呼叫方式與型別
+//  magic number
+//  - 這些常數全部只影響「內部計算與預設值」
+//  - 不影響外部 build() 的呼叫方式與型別
 // ============================================================
 
 // 初始 viewport 用的最小畫布（避免 0 尺寸造成除以 0 或 NaN）
@@ -85,11 +97,6 @@ const CURVE_SAMPLE_COUNT = 60;
 
 // 避免 x=0：因為 indiff curve 常用到 x^a，x=0 容易爆 NaN/Infinity
 const CURVE_XMIN_EPS = 0.0001;
-
-// // Opt label 預設相對位移（避免文字壓在點上）
-// const OPT_LABEL_DX = 8;
-// const OPT_LABEL_DY = -8;
-
 
 // Opt point 半徑
 const OPT_POINT_RADIUS = 4;
@@ -113,20 +120,23 @@ const INDIFF_EQ_DEFAULT_OFFSET: PixelOffset = { offsetDx: 0, offsetDy: 0 };
 const UTILITY_EQ_DEFAULT_OFFSET: PixelOffset = { offsetDx: 0, offsetDy: 0 };
 
 
+// StrokeStyle 要求 dash: number[] 必填
+// - 原因：Strict StrokeStyle = {width, dash, color}
+// - 集中提供「實線 dash」常數，避免每次手寫 []
+//   注意：這個陣列不應被外部 mutate；我們在 factory 會做 slice() 防禦
+const SOLID_DASH: number[] = [];
+
+// TextDrawable 要求 textAnchor 必填
+// - 原因：Strict TextDrawable = { ... textAnchor: "start"|"middle"|"end" }
+//   這裡統一預設，避免每個 text 都手寫
+const DEFAULT_TEXT_ANCHOR: "start" | "middle" | "end" = "start";
+
 
 // ------------------------------------------------------------
 // Domain tuple 型別
 // - 避免 number[] 誤判成 tuple
-// - 
 // ------------------------------------------------------------
 type DomainRange = [number, number];
-
-// ------------------------------------------------------------
-// LabelOffsets value 型別
-// - 寫在 Record 裡，抽出來可重用/更清晰
-// - offsetDx/offsetDy: 
-// ------------------------------------------------------------
-// type LabelOffsetValue = { offsetDx: number; offsetDy: number };
 
 // ------------------------------------------------------------
 //  LabelOffset (標籤拖曳偏移)
@@ -151,20 +161,23 @@ type BuildSceneInput = {
 //  - xMin：indifference curve 採樣下界（避免 x→0 引發數值爆炸）
 // ------------------------------------------------------------
 type DomainConfig = {
-  xEconMax: number;
-  yEconMax: number;
-  xCurveMin: number;
+    xEconMax: number;
+    yEconMax: number;
+    xCurveMin: number;
 };
 
 // ------------------------------------------------------------
-// buildScene() 的輸出（外部呼叫方式不變）：
+// buildScene() 的輸出 (Public API)：
 // - scene：Renderer 要畫的資料
 // - viewport：座標映射器（互動/同步要用）
 // ------------------------------------------------------------
-type BuildSceneOutput = { scene: SceneOutput; viewport: Viewport };
+type BuildSceneOutput = { 
+    scene: SceneOutput; 
+    viewport: Viewport 
+};
 
 // ------------------------------------------------------------
-//  Plot 設定（pixel 尺寸 + viewport）：
+//  Plot 設定（pixel plot size + viewport）：
 //  - Plot 的完整運行配置
 //  - plotWidth/plotHeight：內部繪圖區 pixel 大小
 //  - viewport：把 econ domain 映射到 pixel canvas
@@ -197,7 +210,7 @@ type EconResults = {
 };
 
 // ------------------------------------------------------------
-// Pixel 轉換結果（把 EconResults 映射成 pixel domain）
+//  Pixel 轉換結果（把 EconResults 映射成 pixel domain）
 //  - curvePixelPoints：polyline points（pixel）
 //  - optPixel：最適點 pixel 座標
 // ------------------------------------------------------------
@@ -212,7 +225,7 @@ type PixelResults = {
 //  - 目的：拆方法後不用傳一堆參數，減少漏傳/順序錯誤
 // ------------------------------------------------------------
 type BuildContext = {
-  // 外部輸入
+  // 外部輸入 (snapshot)
   controlOptions: ConsumerViewOptions;
   labelOffsets: LabelOffsets;
 
@@ -228,7 +241,7 @@ type BuildContext = {
   pixel: PixelResults;
 
   // 場景 drawables（Renderer 只需要這個可變列表就能畫）
-  drawables: Drawable[];
+  drawables: DrawableInput[];
 };
 
 
@@ -254,63 +267,72 @@ type HeavyCache = {
 
 
 // ------------------------------------------------------------
-//  Equation label 規格標
+//  Equation label 規格表
 //  - 集中管理: anchor key / default offset / text / spans / color
 //  - 讓新增 lable 不再複製 3 份 appendXXXLabel()
 // ------------------------------------------------------------
 type EquationLabelSpec = {
-    key: LabelKey;    // 這裡只放 equation label keys (utility/budget/indiff)
+    key: LabelKey;    // 只放 equation label keys (utility/budget/indiff)
     defaultOffset: PixelOffset;
+    
+    // 文字 fallback (debug/hit-test)
     buildText: (context: BuildContext) => string;
-    buildSpans: (context: BuildContext, fontSize: number) => any;
+    
+    // spans（支援上標/下標等）
+    // - TextSpan 是 TextSpanInput 的 superset，可直接塞進 TextDrawableInput.spans
+    buildSpans: (context: BuildContext, fontSize: number) => TextSpan[];
+
+    // label 文字顏色
     getFillColor: (context: BuildContext) => string;
 
 }
 
+// ------------------------------------------------------------
+//  EQUATION_LABEL_SPECS: 集中管理 equation labels
+// ------------------------------------------------------------
 const EQUATION_LABEL_SPECS: EquationLabelSpec[] = [
-  {
-    key: "utility-eq",
-    defaultOffset: { offsetDx: 0, offsetDy: 0 },
-    buildText: (ctx) =>
-      "U(x,y) = x^a y^(1-a),  a=" + formatNum(ctx.params.exponent),
-    buildSpans: (ctx, fontSize) => buildUtilitySpans(ctx.params.exponent, fontSize),
-    getFillColor: (ctx) => ctx.controlOptions.indiffColor,
-  },
-  {
-    key: "budget-eq",
-    defaultOffset: BUDGET_EQ_DEFAULT_OFFSET,
-    buildText: (ctx) =>
-      formatNum(ctx.params.px) +
-      "x + " +
-      formatNum(ctx.params.py) +
-      "y = " +
-      formatNum(ctx.params.I),
-    buildSpans: (ctx, fontSize) =>
-      buildBudgetSpans(ctx.params.px, ctx.params.py, ctx.params.I, fontSize),
-    getFillColor: (ctx) => ctx.controlOptions.budgetColor,
-  },
-  {
-    key: "indiff-eq",
-    defaultOffset: INDIFF_EQ_DEFAULT_OFFSET,
-    buildText: (ctx) =>
-      "y = (U0 / x^a)^(1/(1-a)),  U0=" + formatNum(ctx.econ.UtilityAtOptPoint),
-    buildSpans: (ctx, fontSize) =>
-      buildIndiffSpans(ctx.econ.UtilityAtOptPoint, ctx.params.exponent, fontSize),
-    getFillColor: (ctx) => ctx.controlOptions.indiffColor,
-  },
+    {
+        key: "utility-eq",
+        defaultOffset: { offsetDx: 0, offsetDy: 0 },
+        buildText: (ctx) =>
+            "U(x,y) = x^a y^(1-a),  a=" + formatNum(ctx.params.exponent),
+        buildSpans: (ctx, fontSize) => buildUtilitySpans(ctx.params.exponent, fontSize),
+        getFillColor: (ctx) => ctx.controlOptions.indiffColor,
+    },
+    {
+        key: "budget-eq",
+        defaultOffset: BUDGET_EQ_DEFAULT_OFFSET,
+        buildText: (ctx) =>
+            formatNum(ctx.params.px) +
+            "x + " +
+            formatNum(ctx.params.py) +
+            "y = " +
+            formatNum(ctx.params.I),
+        buildSpans: (ctx, fontSize) =>
+            buildBudgetSpans(ctx.params.px, ctx.params.py, ctx.params.I, fontSize),
+        getFillColor: (ctx) => ctx.controlOptions.budgetColor,
+    },
+    {
+        key: "indiff-eq",
+        defaultOffset: INDIFF_EQ_DEFAULT_OFFSET,
+        buildText: (ctx) =>
+            "y = (U0 / x^a)^(1/(1-a)),  U0=" + formatNum(ctx.econ.UtilityAtOptPoint),
+        buildSpans: (ctx, fontSize) =>
+            buildIndiffSpans(ctx.econ.UtilityAtOptPoint, ctx.params.exponent, fontSize),
+        getFillColor: (ctx) => ctx.controlOptions.indiffColor,
+    },
 ];
-
 
 
 export class ConsumerOptSceneBuilder {
     // model：提供經濟計算（budget/optimum/utility/curve）
-    private readonly model: ConsumerOptModel;
+    private readonly model: ConsumerOptModel;  // econ 計算來源
     
     // innerAvailWidth/Height：內部可用繪圖空間 pixel 尺寸
     private readonly innerAvailWidth: number;
     private readonly innerAvailHeight: number;
 
-    // Cache 欄位
+    // Cache 欄位: 避免重算曲線/viewport
     private heavyCache: HeavyCache | null;
 
     // ------------------------------------------------------------
@@ -341,13 +363,14 @@ export class ConsumerOptSceneBuilder {
     }
 
     // ------------------------------------------------------------
-    // buildScene（Public API）- 外部呼叫方式不變
+    // buildScene（Public API）
     // 1) initContext（拿 params + 放預設值）
     // 2) buildHeavyIfNeeded（cache hit → 直接套用；miss → 重算並存入 cache）
     // 3) buildLight（基礎圖元 + labels + clamp + sync）
     // 4) finalize
     // ------------------------------------------------------------
     buildScene(args: BuildSceneInput): BuildSceneOutput {
+        // 建立 context，將外部輸入與中間結果集中管理
         const context = this.initContext(args);
 
         // heavy 計算: 有 cache 就跳過重算，避免 UI 拖曳造成塞車
@@ -356,6 +379,7 @@ export class ConsumerOptSceneBuilder {
         // light 計算: 每次重建(便宜)，確保顏色/字體/顯示切換立即生效
         this.buildLightScene(context);
 
+        // finalize: 組裝 SceneOutput_Input → resolve strict → 回傳
         return this.finalize(context);
     }
 
@@ -387,12 +411,17 @@ export class ConsumerOptSceneBuilder {
         const initYEconDomain: DomainRange = [0,1];
 
         const context: BuildContext = {
+            // 外部輸入 (snapshot)
             controlOptions: args.controlOptions,
             labelOffsets: args.labelOffsets,
+
+            // model params (snapshot)
             params: params,
             
+            // domain 初始值 (之後 computeDomain 會覆寫)
             domain: { xEconMax: 1, yEconMax: 1, xCurveMin: CURVE_XMIN_EPS},
 
+            // plot 初始值 (之後 computePlotAndViewport 會覆寫)
             plot: {
                 plotWidth: initInnerWidth,
                 plotHeight: initInnerHeight,
@@ -404,6 +433,7 @@ export class ConsumerOptSceneBuilder {
                 ),
             },
 
+            // econ 初始值 (之後 computeEconomics 會覆寫)
             econ: {
                 budget: { endPoint1: {x: 0, y: 0}, endPoint2: {x: 0, y: 0} },
                 optEconPoint: { x: 0, y: 0 },
@@ -411,15 +441,18 @@ export class ConsumerOptSceneBuilder {
                 curveEconPoints: [],
             },
 
+            // pixel 初始值 (之後 computePixelMappings 會覆寫)
             pixel: { 
                 curvePixelPoints: [], 
                 optPointPixel: { x: 0, y: 0} 
             },
-            drawables: [],
+
+            // drawables: light 階段組裝
+            drawables: [],  // [CHANGED] 內部只用 DrawableInput[]
         }
 
         return context;
-    };
+    }
 
     // ------------------------------------------------------------
     //  buildHeavyScene
@@ -429,8 +462,10 @@ export class ConsumerOptSceneBuilder {
     //  - cache miss: 重算 heavy，並更新 cache
     // ------------------------------------------------------------
     private buildHeavyScene(context: BuildContext): void {
+        // 依 params + innerAvail size 生成 cache key
         const key = this.makeHeavyCacheKey(context.params);
 
+        // cache hit: 直接將 heavy 結果回填到 context
         if (this.heavyCache) {
             if (this.heavyCache.key === key) {
                 // cache hit: 重用 heavy 計算結果
@@ -448,11 +483,13 @@ export class ConsumerOptSceneBuilder {
         this.computeEconomics(context);
         this.computePixelMappings(context);
 
-        // immutability guard（避免未來不小心改到 cache 內容）
-        // - heavy cache 的結果應視為 immutable；freeze 能提早抓到「意外 mutation」的 bug
-        this.freezeHeavyResults(context);
+        if (isDevMode()) {
+            // immutability guard（避免未來不小心改到 cache 內容）
+            // - heavy cache 的結果應視為 immutable；freeze 能提早抓到「意外 mutation」的 bug
+            this.freezeHeavyResults(context);
+        }
 
-        // 更新 cache（重用 viewport / curvePixelPoints 的成果）
+        // 更新 heavy cache（重用 viewport / curvePixelPoints 的成果）
         this.heavyCache = {
             key: key,
             domain: context.domain,
@@ -479,8 +516,8 @@ export class ConsumerOptSceneBuilder {
         // curve arrays：凍結點物件，再凍結陣列
         let i = 0;
         while (i < context.econ.curveEconPoints.length) {
-        Object.freeze(context.econ.curveEconPoints[i]);
-        i++;
+            Object.freeze(context.econ.curveEconPoints[i]);
+            i++;
         }
         Object.freeze(context.econ.curveEconPoints);
 
@@ -490,12 +527,17 @@ export class ConsumerOptSceneBuilder {
 
         let j = 0;
         while (j < context.pixel.curvePixelPoints.length) {
-        Object.freeze(context.pixel.curvePixelPoints[j]);
-        j++;
+            Object.freeze(context.pixel.curvePixelPoints[j]);
+            j++;
         }
         Object.freeze(context.pixel.curvePixelPoints);
 
+        // pixel 容器: 凍結
         Object.freeze(context.pixel);
+
+        // plot 的 viewport 是 class instance，不凍結（避免意外副作用）
+        // plotWidth/plotHeight 是 number，不需要凍結
+        Object.freeze(context.plot);
     }
 
     // ------------------------------------------------------------
@@ -509,12 +551,14 @@ export class ConsumerOptSceneBuilder {
         py: number; 
         exponent: number 
     }): string {
-        // 這裡使用 join 組字串
+        // 用字串拼 key，避免建立複雜 object hash
         const parts: string[] = [];
 
+        // 可用尺寸要進 key：尺寸變了 viewport 就變了
         parts.push(String(this.innerAvailWidth));
         parts.push(String(this.innerAvailHeight));
-
+        
+        // econ params：任一變動都要重算
         parts.push(String(params.I));
         parts.push(String(params.px));
         parts.push(String(params.py));
@@ -529,23 +573,32 @@ export class ConsumerOptSceneBuilder {
     //  - 確保 UI 立刻生效（顏色、字體、顯示/隱藏）
     // ------------------------------------------------------------
     private buildLightScene(context: BuildContext): void {
+        // 基礎圖元：budget + indiff（一定存在）
         this.buildBaseDrawables(context);
+
+        // opt（可選）：opt point + opt-label
         this.appendOptDrawables(context);
 
         // 一次掃描取得 anchors（只從 drawables 蒐集）
-        const anchorsFromDrawables = findLabelAnchorsOnePass(context.drawables);
+        const strictForAnchorScan = resolveSceneOutput(this.buildSceneOutput_Input(context));
 
+        const anchorsFromDrawables = findLabelAnchorsOnePass(strictForAnchorScan.drawables);
+
+        // anchors 初始 = 從 drawables 掃出來的 anchors（budget/opt-label...）
         let anchors: Partial<Record<LabelKey, PixelPoint>> = anchorsFromDrawables;
+
+        // 若要顯示 equation labels：合併固定 anchors（utility/indiff）
         if (context.controlOptions.showEquationLabels) {
             const fontSize = context.controlOptions.labelFontSize;
             const fixed = buildFixedEquationAnchors(fontSize);
+
             anchors = {
                 ...anchorsFromDrawables,
                 ...fixed,
             };
         }
 
-        // Equation labels 用「規格表」一次處理，不再 3 個 appendXXX 重複邏輯
+        // equation labels 用「規格表」一次處理，不再 3 個 appendXXX 重複邏輯
         this.appendEquationLabels(context, anchors);
 
     }
@@ -583,7 +636,7 @@ export class ConsumerOptSceneBuilder {
             xCurveMin = xMinCandidate;
         }
 
-        // 畫圖的經濟座標範圍
+        // 寫回 context.domain: 畫圖的經濟座標範圍
         context.domain = { xEconMax, yEconMax, xCurveMin };
     }
 
@@ -608,24 +661,45 @@ export class ConsumerOptSceneBuilder {
         const xEconDomain: DomainRange = [0, domain.xEconMax];
         const yEconDomain: DomainRange = [0, domain.yEconMax];
 
-        const plotSize = computePlotInnerSize({
+        // 用 px/py + container size 計算 plot inner size
+        const rawPlotSize = computePlotInnerSize({
             containerInnerWidth: this.innerAvailWidth,
             containerInnerHeight: this.innerAvailHeight,
             px: params.px,
             py: params.py,
         });
 
-        const vp = new Viewport(
-            plotSize.plotInnerWidth,    // innerWidth: number
-            plotSize.plotInnerHeight,   // innerHeight: number
-            xEconDomain,                // xEconDomain: [number, number]
-            yEconDomain                 // yEconDomain: [number, number]
+        // plot size 保底：避免 0 導致 viewport 除以 0
+        const normalized = normalizePlotSize(
+            rawPlotSize.plotInnerWidth, 
+            rawPlotSize.plotInnerHeight
         );
 
-        context.plot = { 
-            plotWidth: plotSize.plotInnerWidth, 
-            plotHeight: plotSize.plotInnerHeight, 
-            viewport: vp 
+
+        // 建立 viewport（econ → pixel mapping）
+        // const vp = new Viewport(
+        //     plotSize.plotInnerWidth,    // innerWidth: number
+        //     plotSize.plotInnerHeight,   // innerHeight: number
+        //     xEconDomain,                // xEconDomain: [number, number]
+        //     yEconDomain                 // yEconDomain: [number, number]
+        // );
+        const vp = new Viewport(
+            normalized.plotInnerWidth,
+            normalized.plotInnerHeight,
+            xEconDomain,
+            yEconDomain
+        );
+
+        // 寫回 context.plot
+        // context.plot = { 
+        //     plotWidth: plotSize.plotInnerWidth, 
+        //     plotHeight: plotSize.plotInnerHeight, 
+        //     viewport: vp 
+        // };
+        context.plot = {
+            plotWidth: normalized.plotInnerWidth,
+            plotHeight: normalized.plotInnerHeight,
+            viewport: vp,
         };
     }
 
@@ -645,10 +719,16 @@ export class ConsumerOptSceneBuilder {
     private computeEconomics(context: BuildContext): void {
         const domain = context.domain;
 
+        // budget：預算線端點（econ）
         const modelBudget = this.model.computeBudget();
+
+        // opt：最適點（econ）
         const optEconPoint = this.model.computeOptimum();
+        
+        // U0：最適點效用
         const utilityLevelAtOpt = this.model.computeUtilityAt(optEconPoint.x, optEconPoint.y);  // U0
 
+        // curve：通過最適點的 indifference curve（econ points）
         const curveEconPoints = this.model.computeIndifferenceCurve(
             utilityLevelAtOpt, 
             domain.xCurveMin, 
@@ -656,11 +736,13 @@ export class ConsumerOptSceneBuilder {
             CURVE_SAMPLE_COUNT,
         );
 
+        // 組 budget 容器
         const budget = {
             endPoint1: modelBudget.p1,
             endPoint2: modelBudget.p2,
-        }
+        };
 
+        // 寫回 context.econ
         context.econ = {
             budget: budget,
             optEconPoint: optEconPoint,
@@ -682,21 +764,18 @@ export class ConsumerOptSceneBuilder {
     //  - optPointPoint：最適點（pixel）
     // ------------------------------------------------------------
     private computePixelMappings(context: BuildContext): void {
-        // const vp = context.plot.viewport;
-        // const econ = context.econ;
-        
-        // const curvePixelPoints = econ.curveEconPoints.map((point) => vp.econToPixelMapping(point));
-        // const optPixelPoint = vp.econToPixelMapping(econ.optEconPoint);
-        
-        // context.pixel = { curvePixelPoints, optPixelPoint };
         const vp = context.plot.viewport;
         const econ = context.econ;
 
+        // curve econ points → curve pixel points
         const curvePixelPoints = econ.curveEconPoints.map((pt) => 
             vp.econToPixelMapping(pt)
         );
+
+        // opt econ point → opt pixel point
         const optPointPixel = vp.econToPixelMapping(econ.optEconPoint);
 
+        // 寫回 context.pixel
         context.pixel = { curvePixelPoints, optPointPixel };
     }
 
@@ -720,21 +799,30 @@ export class ConsumerOptSceneBuilder {
         const pixel = context.pixel;
         const controlOption = context.controlOptions;
 
-        const budgetLine: Drawable = {
+        // budget line (pixel)
+        const budgetLine: DrawableInput = {
             kind: "line",
             id: "budget",
             minEndPoint: vp.econToPixelMapping(econ.budget.endPoint1),
             maxEndPoint: vp.econToPixelMapping(econ.budget.endPoint2),
-            stroke: { width: STROKE_WIDTH, color: controlOption.budgetColor },
+            stroke: { 
+                width: STROKE_WIDTH, 
+                color: controlOption.budgetColor 
+            },
         };
 
-        const indiffCurve: Drawable = {
+        // indiff curve (pixel polyline)
+        const indiffCurve: DrawableInput = {
             kind: "polyline",
             id: "indiff",
             points: pixel.curvePixelPoints,
-            stroke: { width: STROKE_WIDTH, color: controlOption.indiffColor },
+            stroke: { 
+                width: STROKE_WIDTH, 
+                color: controlOption.indiffColor 
+            },
         };
 
+        // 重建 drawables（確保每次 buildLight 都是乾淨列表）
         context.drawables = [];
         context.drawables.push(budgetLine);
         context.drawables.push(indiffCurve);
@@ -755,28 +843,28 @@ export class ConsumerOptSceneBuilder {
     private appendOptDrawables(context: BuildContext): void {
         const controlOption = context.controlOptions;
 
+        // 若 UI 關閉 opt，就完全不加入 opt drawables
         if (!controlOption.showOpt) {
             return;
         }
 
+        // opt 點 pixel 座標 (heavy 已算好)
         const optPointPixel = context.pixel.optPointPixel;
 
+        // opt point drawable
         context.drawables.push({
             kind: "point",
             id: "opt",
             center: optPointPixel,
             r: OPT_POINT_RADIUS,
             fill: { color: controlOption.optPointColor },
+            // stroke 不填 → resolver 補預設 stroke
         });
         
+        // label clamp 的 plot area (避免 label 出界)
         const plotArea = this.getLabelPlotArea(context.plot);
 
-        // // opt-label 初始位置: 也進行 clamp，避免一開始就出界
-        // const optAnchor: PixelPoint = {
-        //     x: optPointPixel.x + OPT_LABEL_NUDGE.offsetDx,
-        //     y: optPointPixel.y + OPT_LABEL_NUDGE.offsetDy,
-        // }
-
+        // label pos: anchor = optPointPixel + defaultOffset + dragOffset
         const rawOptLabelPos = resolveLabelPos({
             labelKey: "opt-label",
             anchor: optPointPixel,
@@ -785,16 +873,21 @@ export class ConsumerOptSceneBuilder {
             dragOffsetByLabelKey: context.labelOffsets,
         });
 
+        // clamp: 避免跑出 plot
         const clampedOptLabelPixel = clampToPlot(plotArea, rawOptLabelPos);
 
+        // opt-label fontSize：跟 controlOption.labelFontSize 同步（避免 magic number 12）
         context.drawables.push({
             kind: "text",
             id: "opt-label",
             pos: clampedOptLabelPixel,
             text: "Opt",
-            fontSize: 12,
+            // fontSize: 12,
+            fontSize: controlOption.labelFontSize,
             fill: { color: controlOption.optTextColor },
             draggable: true,
+            // textAnchor 不填 → resolver 補 DEFAULT_TEXT_ANCHOR
+            // spans 不填 → resolver 會產生空陣列
         });
     }
 
@@ -808,19 +901,26 @@ export class ConsumerOptSceneBuilder {
     ): void {
         const controlOption = context.controlOptions;
 
+        // 若 UI 關閉 equation labels，就直接不做
         if (!controlOption.showEquationLabels) {
             return;
         }
 
+        // 字體大小 (由 UI 控制)
         const fontSize = controlOption.labelFontSize;
+
+        // clamp plot area
         const plotArea = this.getLabelPlotArea(context.plot);
 
+        // 走訪規格表
         let specIdx = 0;
         while (specIdx < EQUATION_LABEL_SPECS.length) {
             const spec = EQUATION_LABEL_SPECS[specIdx];
 
+            // 取得該 label 的 anchor (可能不存在)
             const anchor = anchors[spec.key];
             if (anchor) {
+                // anchor + defaultOffset + dragOffset → raw pos
                 const rawPos = resolveLabelPos({
                     labelKey: spec.key,
                     anchor: anchor,
@@ -829,8 +929,10 @@ export class ConsumerOptSceneBuilder {
                     dragOffsetByLabelKey: context.labelOffsets,
                 });
 
+                // clamp: 避免 label 出界
                 const clampedPos = clampToPlot(plotArea, rawPos);
 
+                // push text drawable (equation label 可拖)
                 context.drawables.push({
                     kind: "text",
                     id: spec.key,
@@ -840,15 +942,11 @@ export class ConsumerOptSceneBuilder {
                     fontSize: fontSize,
                     fill: { color: spec.getFillColor(context) },
                     draggable: true,
+                    // textAnchor 不填 → resolver 補
                 });
             }
-
             specIdx++;
         }
-
-        console.log("[plotArea]", plotArea);
-        console.log("[indiffOffset]", context.labelOffsets["indiff-eq"]);
-
     }
 
     // ------------------------------------------------------------
@@ -865,19 +963,42 @@ export class ConsumerOptSceneBuilder {
     //  - BuildOutput：{ scene, viewport }
     // ------------------------------------------------------------
     private finalize(context: BuildContext): BuildSceneOutput {
-        const scene: SceneOutput = {
-            width: context.plot.plotWidth,
-            height: context.plot.plotHeight,
-            drawables: context.drawables,
-            xDomain: [0, context.domain.xEconMax],
-            yDomain: [0, context.domain.yEconMax],
-        };
+        // const scene: SceneOutput = {
+        //     width: context.plot.plotWidth,
+        //     height: context.plot.plotHeight,
+        //     drawables: context.drawables,
+        //     xDomain: [0, context.domain.xEconMax],
+        //     yDomain: [0, context.domain.yEconMax],
+        // };
 
+        // 組 resolver input
+        const sceneInput = this.buildSceneOutput_Input(context);
+        
+        // 轉為 strict type (補齊所有必填欄位)
+        const scene = resolveSceneOutput(sceneInput);
+
+        // viewport 直接回傳 heavy 的結果 (互動需要)
         return { scene, viewport: context.plot.viewport };
     }
 
     // ------------------------------------------------------------
-    //  getLabelPlotArea
+    //  buildSceneOutputInput: 集中組裝 resolver 的 input
+    // ------------------------------------------------------------
+    private buildSceneOutput_Input(context: BuildContext): SceneOutput_Input {
+        const input: SceneOutput_Input = {
+            width: context.plot.plotWidth,
+            height: context.plot.plotHeight,
+            drawables: context.drawables,  // 這裡依然是 DrawableInput[]
+            xDomain: [0, context.domain.xEconMax],
+            yDomain: [0, context.domain.yEconMax],
+        }
+        return input;
+    }
+
+
+
+    // ------------------------------------------------------------
+    //  getLabelPlotArea (private): clamp 環境參數
     // ------------------------------------------------------------
     private getLabelPlotArea(plot: PlotConfig): PlotArea {
         return {
@@ -889,6 +1010,60 @@ export class ConsumerOptSceneBuilder {
 
 }
 
+// ------------------------------------------------------------
+//  isDevMode：只在 dev 做 freeze（抓 mutation）
+//  - 寫法沿用你 Controller 的策略（Vite import.meta.env.DEV + globalThis.__DEV__ fallback）
+// ------------------------------------------------------------
+function isDevMode(): boolean {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const metaAny = import.meta as any;
 
+    if (metaAny && metaAny.env && typeof metaAny.env.DEV === "boolean") {
+      return metaAny.env.DEV;
+    }
+  } catch (_e) {
+    // ignore
+  }
 
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const g: any = globalThis as any;
+
+    if (g && typeof g.__DEV__ === "boolean") {
+      return g.__DEV__;
+    }
+  } catch (_e2) {
+    // ignore
+  }
+
+  return false;
+}
+
+// ------------------------------------------------------------
+//  normalizePlotSize：避免 0 尺寸造成 viewport 除以 0
+// ------------------------------------------------------------
+function normalizePlotSize(
+    plotInnerWidth: number,
+    plotInnerHeight: number
+): { plotInnerWidth: number; plotInnerHeight: number } {
+    let w = plotInnerWidth;
+    let h = plotInnerHeight;
+
+    if (typeof w !== "number" || Number.isFinite(w) === false) {
+        w = DEFAULT_INIT_PLOT_PIXEL_SIZE;
+    }
+    if (typeof h !== "number" || Number.isFinite(h) === false) {
+        h = DEFAULT_INIT_PLOT_PIXEL_SIZE;
+    }
+
+    if (w < DEFAULT_INIT_PLOT_PIXEL_SIZE) {
+        w = DEFAULT_INIT_PLOT_PIXEL_SIZE;
+    }
+    if (h < DEFAULT_INIT_PLOT_PIXEL_SIZE) {
+        h = DEFAULT_INIT_PLOT_PIXEL_SIZE;
+    }
+
+    return { plotInnerWidth: w, plotInnerHeight: h };
+}
 
