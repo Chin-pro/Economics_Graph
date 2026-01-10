@@ -105,7 +105,7 @@ const OPT_POINT_RADIUS = 4;
 const STROKE_WIDTH = 2;
 
 // label clamp padding：避免文字貼邊被裁切/難以點擊
-const LABEL_CLAMP_PADDING_PX = 12;
+export const LABEL_CLAMP_PADDING_PIXEL = 12;
 
 // budget-eq anchor 是「線段中點」，若 offset = 0,0 常會壓在線上，
 // 初始排版會難以閱讀/難以點擊；但這只是「初始位置」：
@@ -1004,7 +1004,7 @@ export class ConsumerOptSceneBuilder {
         return {
             width: plot.plotWidth,
             height: plot.plotHeight,
-            padding: LABEL_CLAMP_PADDING_PX,
+            padding: LABEL_CLAMP_PADDING_PIXEL,
         };
     }
 

@@ -94,6 +94,7 @@ const UTILITY_FIXED_ANCHOR: PixelPoint = {
 //   用 fontSize 推導行距（語義是排版規則，不是拍腦袋座標）
 export const LABEL_LINE_HEIGHT_RATIO = 1.4;
 
+
 // 提供「固定方程式標籤」的 anchors（由 fontSize 推導排版）
 // - indiff-eq 不應該綁曲線中點（會跟 opt 拖曳漂移；a 大時可能 NaN）
 //    這裡把 indiff-eq 變成「圖的註記」，跟 utility-eq 同類：穩定、可讀。

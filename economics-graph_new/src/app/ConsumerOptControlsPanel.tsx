@@ -1,45 +1,81 @@
 // src/app/ConsumerOptControlsPanel.tsx
+
 // ------------------------------------------------------------
-// ✅ [NEW] ControlsPanel：純 UI（SRP）
-// - 不 new controller/model
-// - 不處理 scene
-// - 只用 props 收值、回呼
+//  ControlsPanel：純 UI 控制面板
+//  - 只負責把 state 渲染成 UI (checkbox、slider、input、select...)
+//  - 使用 props 的 callback 把使用這操作回傳給上層
+//
+//  Scope:
+//  - 不 new controller/model
+//  - 不處理 scene build
 // ------------------------------------------------------------
 
 import React from "react";
 import { ControlledSlider } from "../common/ControlledSlider";
 import type { ConsumerViewOptions } from "../core/types";
 
+// 允許的 ticks 常數
 const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10];
 
 export type ControlsState = {
-  I: number;
-  a: number;
-  px: number;
-  py: number;
+    // model parameters
+    I: number;
+    exponent: number;
+    px: number;
+    py: number;
 
-  ticks: number;
-  showTickLines: boolean;
-  showTickLabels: boolean;
+    // 坐標軸 / 刻度 UI
+    ticks: number;
+    showTickLines: boolean;
+    showTickLabels: boolean;
+    xLabel: string;    // 於 X 軸 顯示的文字
+    yLabel: string;    // 於 Y 軸 顯示的文字
 
-  xLabel: string;
-  yLabel: string;
+    // 圖表標題 UI
+    chartTitle: string;          // 標題文字
+    showXLabel: boolean;         // 是否顯示 X 標籤
+    showYLabel: boolean;         // 是否顯示 Y 標籤
 
-  chartTitle: string;
-  showXLabel: boolean;
-  showYLabel: boolean;
+    showChartTitle: boolean;     // 是否顯示標題
+    chartTitleFontSize: number;  // 標題字體大小
 
-  showChartTitle: boolean;
-  chartTitleFontSize: number;
+    exportFileName: string;      // 匯出檔名
 
-  exportFileName: string;
-
-  // view options（會同步到 controller）
-  viewOptions: ConsumerViewOptions;
+    // view options（會同步到 controller，表示 UI 改變會影響圖形渲染）
+    // 視覺層 (顏色、方程式字體大小、是否顯示 Opt/Equation labels...)
+    viewOptions: ConsumerViewOptions;
 };
 
-export function ConsumerOptControlsPanel(props: {
-  state: ControlsState;
+
+// ------------------------------------------------------------
+//  ConsumerOptControlsPanel (主元件)
+//  1. state: ControlsState
+//   - Input：控制面板所有顯示都由它決定（典型受控元件模式）
+//
+//  2. onChangeState(patch)
+//   - 通知上層「請把 state 合併 patch」
+//   - Input：Partial<ControlsState>，只帶要改的欄位
+//   - Output：void（副作用由上層處理，例如 setState + 同步 controller）
+//
+//  3. onChangeTicks(ticks)
+//   - ticks 可能需要上層做「額外行為」（例如：重新算 tick positions 或觸發 scene rebuild）
+//     所以獨立一個 handler
+//   - Input：ticks（已被驗證在允許範圍內）
+//
+//  4. onIncomeChange / onAlphaChange / onPxChange / onPyChange
+//   - 直接對 model params 做更新（通常會觸發 heavy rebuild）
+//   - Input：對應數值
+//  
+//  5. onViewOptionsChange(patch)
+//   - 視覺變更通常走 light patch 或較輕量更新（依你 controller 設計）
+//   - Input：只修改 ConsumerViewOptions 的部分欄位
+//
+//  6. onExportClick()
+//   - 觸發匯出 SVG（上層應該拿到目前 scene/svg DOM 然後輸出）
+//   - Input：無
+// ------------------------------------------------------------
+export default function ConsumerOptControlsPanel(props: {
+  state: ControlsState;    // 輸入資料: 控制面板所有顯示都由它決定(典型受控元件模式)
 
   onChangeState: (patch: Partial<ControlsState>) => void;
 
@@ -277,7 +313,7 @@ export function ConsumerOptControlsPanel(props: {
         min={0.1}
         max={0.9}
         step={0.01}
-        value={Number(s.a.toFixed(2))}
+        value={Number(s.exponent.toFixed(2))}
         onChange={(nextA) => props.onAlphaChange(nextA)}
       />
 

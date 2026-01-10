@@ -12,8 +12,13 @@
 //
 // Heavy/Light split pipleline:
 // - Heavy: 呼叫 builder.buildScene(...) (通常包含 econ 計算)
-// - Light: 不呼叫 builder，只 patch 現有 scene (顯示/隱藏/更新 label 位置) 
-// 
+// - Light: 不呼叫 builder，只 patch 現有 scene (顯示/隱藏/更新 label 位置)
+//
+// [FREEZE] 這裡修正註解：目前 Controller 沒有做 scene patch，而是依賴 builder heavy-cache 來達到輕算
+//          之後可以將 Light Cache 分離出來
+// [FREEZE] 再次將進行 SRP，目前 ConsumerOptController.ts 依然太多冗長
+//
+//
 // rAF coalesce: 同一個 frame 只 flush 一次
 //
 // 避免 cache 汙染 (reference leakage)
@@ -39,8 +44,13 @@ import { ConsumerOptModel } from "../model/ConsumerOptModel";
 // ConsumerViewOptions: 純視覺/顯示層選項 (顯示 label? 字體大小? 顏色? 是否顯示 opt?)
 import type { ConsumerViewOptions } from "../../core/types";
 
-// ConsumerOptSceneBuilder: 把 (model + options + labelOffsets) 組裝成 SceneOutput + Viewport
-import { ConsumerOptSceneBuilder } from "./consumerOptSceneBuilder";
+// ConsumerOptSceneBuilder.ts: 
+// - class ConsumerOptSceneBuilder: 把 (model + options + labelOffsets) 組裝成 SceneOutput + Viewport
+// - LABEL_CLAMP_PADDING_PIXEL: 預設邊界空白 padding = 12
+import { 
+    ConsumerOptSceneBuilder,
+    LABEL_CLAMP_PADDING_PIXEL,  // 預設邊界空白 padding = 12
+} from "./consumerOptSceneBuilder";
 
 // consumerOptLabel.ts：專門處理 label 相關幾何規則：
 // - findLabelAnchorOnePass (drawables)：回傳 anchors map
@@ -133,9 +143,6 @@ export class ConsumerOptController {
     // dirty: 是否有尚未 flush 的變更 (heavyDirty 代表至少需要 heavy 等級)
     private heavyDirty: boolean;
     private lightDirty: boolean;
-
-    // pendingKind: 累積到目前為止最高等級 (heavy > light)
-    private pendingKind: RebuildKind | null;
     
     // hasScheduledFlush: 避免同一 frame 重複排程
     private hasScheduledFlush: boolean;
@@ -150,7 +157,11 @@ export class ConsumerOptController {
 
     // ------------------------------------------------------------
     //  constructor
-    //  
+    //  - 建立 builder = new ConsumerOptSceneBulider({ model, innerAvailWidth, innerAvailHeight }) 
+    //  - 初始化 lastScene/lastViewport = null: 首次 getScene/getViewport 會同步 build 一次
+    //  - 設定 heavyDirty/lightDirty = true: 表示一開始至少要 build 一次
+    //  - 初始化排成狀態: 避免重複排程 flush
+    // 
     //  Input: args = { innerAvailW, innerAvailH, model }
     //  - innerAvailW/H：可用繪圖區域大小（扣掉 UI 或 padding 後）
     //  - model：由外部建立的 ConsumerOptModel（注入依賴）
@@ -162,6 +173,7 @@ export class ConsumerOptController {
         innerAvailHeight: number; 
         model: ConsumerOptModel;
     }) {
+        // Dependencies
         // 依賴注入：外部提供 model（single source of truth）
         // 把外部傳入的 model 存起來，之後 slider/drag 都會改它
         this.model = args.model;
@@ -170,9 +182,12 @@ export class ConsumerOptController {
         // 依賴注入：builder 不是自己 new model，而是接收同一個 model
         // 確保 single source of truth：model 狀態只有一份
         this.builder = new ConsumerOptSceneBuilder({
+            // 整個經濟狀態的 single source of truth
+            // - Controller 的 slider/drag 都會呼叫 model setter；builder 讀取 model 產生 scene
+            // - 必須是已初始化可用的 model (具備 setIncome/setAlpha/setPrices/getModelParams/...)
             model: this.model,
-            innerAvailWidth: args.innerAvailWidth,
-            innerAvailHeight: args.innerAvailHeight,
+            innerAvailWidth: args.innerAvailWidth,    // 可用繪圖區寬度(已扣掉外框、UI padding等)
+            innerAvailHeight: args.innerAvailHeight,  // 可用繪圖區寬度(已扣掉外框、UI padding等)
         });
 
         // pub/sub init
@@ -199,14 +214,14 @@ export class ConsumerOptController {
             indiffColor: "#111111",
         };
 
+        // Controller-owned UI state
         // labelOffsets 起始為空物件：表示 label 都在預設位置（無偏移）
         this.labelOffsets = {};
 
-        // rAF coalesce init
+        // rAF coalesce state (init)
         // - 初始尚未 build，視為需要 flush (起始預設 heavy)
         this.heavyDirty = true;
         this.lightDirty = true;
-        this.pendingKind = "heavy";
 
         // 初始化排成狀態
         this.hasScheduledFlush = false;
@@ -222,24 +237,44 @@ export class ConsumerOptController {
 
     // ------------------------------------------------------------
     //  subscribe
+    //  - 提供 View (或外部) 一個方式「訂閱 scene 更新」
+    //    這是典型 pub/sub: Controller 不知道用得是 React/Vue/vanilla，反正 scene 更新時會通知
+    //
     //  - 把一個 callback 加入 listeners，之後 scene 更新會通知它
-    //  - 訂閱 scene 更新事件: 每次 rebuildAndNotify 都會呼叫 fn(scene)
+    //    保留 可以在 listeners 陣列中 進行去重
+    // 
+    //  - subscribe 回傳 unsubscribe，並進行去重，避免 React 重複訂閱造成重複 render
+    //
+    //  - 內部會用 concat 產生新陣列 (immutable-ish)，降低遍歷中被 mutate 的風險
     //
     //  Input: fn（Listener）
+    //  - 當 scene 更新時要做的事 (常見是 React setState)
     //
-    //  Output: void
-    //
-    // 保留 可以在 listeners 陣列中 進行去重
+    //  Output: () => this.unsubscribe(fn)
+    //  - 讓呼叫端方便  cleanup (特別是 React useEffect cleanup)
     // ------------------------------------------------------------
     subscribe(fn: Listener) {
-      this.listeners.push(fn);
+        // this.listeners.push(fn);
+
+        let listenerIdx = 0;
+        while (listenerIdx < this.listeners.length) {
+            if (this.listeners[listenerIdx] === fn) {
+                return () => this.unsubscribe(fn);
+            }
+            listenerIdx++;
+        }
+
+        // 用 concat 避免直接 push (可讀性 + 可接近 immutable-ish)
+        this.listeners = this.listeners.concat([fn]);
+
+        return () => this.unsubscribe(fn);
     }
 
     // ------------------------------------------------------------
     //  unsubscribe
     //  - 把某個 callback 從 listeners 移除
     //  - 取消訂閱: 將指定的 fn 從 listeners 移除
-    //  - 避免在遍歷時修改同一個陣列造成邏輯錯誤，透過建立新陣列的方式，
+    //  - 不直接 splice 原陣列，避免在遍歷時修改同一個陣列造成邏輯錯誤，改透過建立新陣列的方式，
     //    行為更可預期，避免汙染 (immutable-ish)
     // 
     //  Input: fn（Listener）
@@ -278,26 +313,23 @@ export class ConsumerOptController {
     // 
     //  Input: none
     //
-    //  Output: SceneOutput
+    //  Output: SceneOutput: snapshot
+    //  - SceneOuput 結構 { width, height, drawables, xDomain, yDomain }
+    //  - 永遠回傳 clone，避免外部拿到 cache reference
     // ------------------------------------------------------------
     getScene(): SceneOutput {
         // cache hit: 若快取存在，直接回傳（避免重建）
         if (this.lastScene !== null) {
             const snapshot = cloneSceneOutput(this.lastScene);
-            if (isDevMode()) deepFreezeSceneOutput(snapshot);
+            if (isDevMode()) {
+                deepFreezeSceneOutput(snapshot)
+            };
             return snapshot;
         }
 
         // cache miss: 新建一次 cache: build.scene
         // this.rebuildCache();
         this.rebuildCacheSync();
-
-        // // 防禦式寫法：理論上不會發生，保險
-        // // - 理論上 rebuildCache 一定會填 lastScene
-        // // - 若如果未來 builder 失敗回傳空值，這裡至少再嘗試一次
-        // if (!this.lastScene) {
-        //     this.rebuildCache();
-        // }
 
         // 重試後，依然為空，則直接報錯
         if (this.lastScene === null) {
@@ -319,6 +351,7 @@ export class ConsumerOptController {
     // ------------------------------------------------------------
     //  getViewport
     //  - 取得目前 viewport（cache hit: 快取存在就回傳；cache miss: build 一次）
+    //  - 提供互動所需的 pixel 
     //  
     //  - Viewport 是 class instance，不適合 clone (也不一定需要)
     //    但它仍然是「reference 外洩」的潛在點，在這裡使用「約定」:
@@ -327,8 +360,11 @@ export class ConsumerOptController {
     //  Input: none
     //
     //  Output: Viewport
+    //  - Viewport 應該是「pure mapping」工具 (不在乎時 mutate 狀態)
+    //  - 這裡沒有 clone，因為 class instance clone 成本高且不必要，用「約定」來控制
     // 
     //  保留: 調整 error handling 策略 ??????
+    //  ???? 為甚麼不 clone
     // ------------------------------------------------------------
     getViewport(): Viewport {
         // cache hit: 檢查 cache (快取)
@@ -347,6 +383,7 @@ export class ConsumerOptController {
                 "[ConsumerOptController] rebuildCache() did not produce a Viewport."
             );
         }
+
         return this.lastViewport;
     }
 
@@ -358,6 +395,9 @@ export class ConsumerOptController {
     //
     //  Output:
     //  - 由 model.getModelParams() 決定的型別，通常是一個 params object
+    //    { income, alpha, px, py, ... }
+    //  - 這裡不進行 clone: 因為 model.getModelParams 通常應回應「值物件」或 readonly snapshot
+    //  ???? 為甚麼不 clone
     // ------------------------------------------------------------
     getModelParamsSnapshot() {
          return this.model.getModelParams();
@@ -373,6 +413,11 @@ export class ConsumerOptController {
     //  - 更新 view options (只允許部分更新 patch)，並集中驗證 (Ex: 字體大小範圍)
     //  - [CHANGED] 不再 rebuildAndNotify() 立即重建
     //              改成 requestRebuild("light") → rAF coalesce
+    //  - [CHANGED] clamp fontSize 不直接 mutate 既有物件欄位，改成先計算出 clamped 值再回填 (較乾淨)
+    //
+    //  - 先進行 merge: { ...oldOptions, ...patch }
+    //    clamp labelFontSize 在 [8,28]
+    //    不立即 rebuild: 改為 coalesce (減少重算/重繪風暴)
     //
     //  Input:
     //  - patch: Partial<ConsumerViewOptions>  (path: 補丁，只修改部分欄位)
@@ -381,31 +426,39 @@ export class ConsumerOptController {
     //    - 用途：讓外部只更新部分 options (Ex: { showOpt: false } 或 { labelFontSize: 16 })
     //
     //  Output: void
+    //  - 更新 this.controlViewOptions
+    //  - 呼叫 requestRebuild("light") (排程 flush)
     // ------------------------------------------------------------
     setViewOptions(patch: Partial<ConsumerViewOptions>) {
-      // 產生 next options（immutable update），避免直接 mutate this.options (汙染)
-      // - 先展開舊 options
-      // - 再展開 patch 覆蓋同名欄位
-        const nextConsumerViewOption: ConsumerViewOptions = { 
-            ...this.controlViewOptions, 
-            ...patch 
+        // 產生 next options（immutable update），避免直接 mutate this.options (汙染)
+        // - 先展開舊 options
+        // - 再展開 patch 覆蓋同名欄位
+        const mergedConsumerViewOption: ConsumerViewOptions = {
+            ...this.controlViewOptions,
+            ...patch,
         };
 
         // 防呆機制：字體大小範圍
         // - 集中驗證：所有 UI 設定改動都會通過同一個入口，避免散落在各個 onChange handler 裡
-        if (nextConsumerViewOption.labelFontSize < 8) {
-            nextConsumerViewOption.labelFontSize = 8;
+        let nextFontSize = mergedConsumerViewOption.labelFontSize;
+        if (nextFontSize < 8) {
+            nextFontSize = 8;
         }
-        if (nextConsumerViewOption.labelFontSize > 28) {
-            nextConsumerViewOption.labelFontSize = 28;
+        if (nextFontSize > 28) {
+            nextFontSize = 28;
         }
+
+        const nextConsumerViewOption: ConsumerViewOptions = {
+            ...mergedConsumerViewOption,
+            labelFontSize: nextFontSize,
+        };
 
         // 更新 options 並重建 scene 通知 view
         this.controlViewOptions = nextConsumerViewOption;  // 型別皆為 (type) ConsumerViewOptions
         
         // this.rebuildAndNotify();
         
-        // 視覺層變動 (顏色/字體/顯示) 屬於 light
+        // 視覺層變動 (顏色/字體/顯示) → light rebuild
         this.requestRebuild("light");
     }
 
@@ -416,11 +469,14 @@ export class ConsumerOptController {
 
     // ------------------------------------------------------------
     //  onIncomeChange
-    //  - 作用：把 income 寫回 model，然後 rebuild scene / 通知 view (渲染)
+    //  - 把 income 寫回 model，然後 rebuild scene / 通知 view (渲染)
+    //    UI slider/輸入改變 income 時的入口。income 影響 budget/opt/曲線 → 必須 heavy rebuild
     //
     //  Input: nextIncome（新的 income 數值）
     //
     //  Output: void
+    //  - model.setIncome(nextIncome)
+    //  - requestRebuild("heavy")
     // ------------------------------------------------------------
     onIncomeChange(nextIncome: number) {
         this.model.setIncome(nextIncome);
@@ -434,10 +490,13 @@ export class ConsumerOptController {
     // ------------------------------------------------------------
     //  onAlphaChange
     //  - 更新 alpha (偏好權重)，然後 rebuild scene / 通知 view (渲染)
+    //  - alpha 影響 indiff/optimum → 必須 heavy rebuild。
     //
     //  Input: nextA（新的 alpha 效用權重）
     //
     //  Output: void
+    //  - model.setAlpha(nextAlpha)
+    //  - requestRebuild("heavy")
     // ------------------------------------------------------------
     onAlphaChange(nextAlpha: number) {
         this.model.setAlpha(nextAlpha);
@@ -452,7 +511,8 @@ export class ConsumerOptController {
     //  onPxChange
     //  - 更新 px (價格)，，然後 rebuild scene / 通知 view (渲染)
     //  - 做了最小值限制 px >= 0.1，避免 px 太小導致 budget 線斜率爆炸/數值不穩，或除以 0
-    //  
+    //  - 更新價格 px/py，價格影響 budget slope、可行集合、optimum、viewport domain → heavy rebuild
+    //
     //  Input: nextPx（新的 px）
     //
     //  Output: void
@@ -513,6 +573,9 @@ export class ConsumerOptController {
     //  - pixel: {x, y}（滑鼠/指標在 SVG 像素座標）
     //
     //  Output: void
+    //  - 讀取 viewport 做映射
+    //  - 計算 nextAlpha 並寫回 model
+    //  - heavy rebuild
     // ------------------------------------------------------------
     onPointDrag(id: string, pixel: { x: number; y: number }) {
         // Opt 關閉就不允許拖
@@ -531,6 +594,13 @@ export class ConsumerOptController {
         const vp = this.getViewport();
         const econ = vp.pixelToEconMapping(pixel);
 
+
+        // 防禦：拖到畫面外可能映射出負值，先做下界保護
+        let econX = econ.x;
+        let econY = econ.y;
+        if (econX < 0) { econX = 0; }
+        if (econY < 0) { econY = 0; }
+
         // denom = x+y，用來把 (x,y) 正規化成一個比例 ?????
         // alpha = x/(x+y)
         // 把 opt 的拖曳想像成在 simplex（x+y>0）的比例移動。
@@ -539,7 +609,7 @@ export class ConsumerOptController {
             return;
         }
 
-        let nextAlpha = econ.x / denom;
+        let nextAlpha = econX / denom;  // clamped
 
         // 將 alpha 限制在 [0.1, 0.9]
         // 避免 alpha 太接近 0 或 1 造成圖形退化（例如 indiff curve 或最適角點狀態太極端）
@@ -575,6 +645,8 @@ export class ConsumerOptController {
     //  - pixel: {x,y}（拖曳到的位置）
     //
     //  Output: void
+    //  - 更新 this.labelOffsets[id] = {offsetDx, offsetDy}（immutable update）
+    //  - requestRebuild("light")
     // ------------------------------------------------------------
     onTextDrag(id: string, pixel: { x: number; y: number }) {
         // 只允許 LabelKey 進入 offsets/anchors 流程
@@ -611,7 +683,7 @@ export class ConsumerOptController {
         const plotArea: PlotArea = {
             width: scene.width,
             height: scene.height,
-            padding: 2,
+            padding: LABEL_CLAMP_PADDING_PIXEL,
         }
 
         const positionPixelPoint: PixelPoint = {
@@ -634,8 +706,15 @@ export class ConsumerOptController {
             offsetDy: clamped.y - anchor.y,
         };
 
+        // // 記錄偏移: 寫入 offsets，拖曳才會生效
+        // this.labelOffsets[id] = offsets;
+
         // 記錄偏移: 寫入 offsets，拖曳才會生效
-        this.labelOffsets[id] = offsets;
+        // - 用 immutable update，避免長期維護時不小心引入共享引用問題
+        this.labelOffsets = {
+            ...this.labelOffsets,
+            [id]: { offsetDx: offsets.offsetDx, offsetDy: offsets.offsetDy },
+        };
 
         // rebuild scene（builder 會把 offset 套上）
         // this.rebuildAndNotify();
@@ -650,9 +729,9 @@ export class ConsumerOptController {
     // ============================================================
 
     // ------------------------------------------------------------
-    //  requestRebuild
+    //  requestRebuild (private)
     //  - Controller 的「重建請求入口」
-    //  - 只標記 dirty + 排程 flush
+    //  - 只標記 dirty + 排程 flush，不立即 build
     //
     //  目的:
     //  - heavy > light: 如果同一 frame 既有 light 又有 heavy，最後以 heavy 為準
@@ -663,23 +742,11 @@ export class ConsumerOptController {
             // 代表整個結果都可能需要更新
             this.heavyDirty = true;
             this.lightDirty = true;
-            this.pendingKind = "heavy";
         }
 
         if (kind === "light") {
             // 只要有任何視覺變動就需要
             this.lightDirty = true;
-
-            // 若目前沒有 pending 或 pending 是 light，就維持/設定 light
-            // 若 pending 已經是 heavy，就保持 heavy (不降級)
-            if (this.pendingKind === null) {
-                this.pendingKind = "light";
-            } else {
-                if (this.pendingKind === "light") {
-                    this.pendingKind = "light";
-                }
-                // pendingKind === "heavy": 保持 heavy，不執行任何動作
-            }
         }
         
         // 排程 flush (同 frame 只會排一次)
@@ -687,8 +754,16 @@ export class ConsumerOptController {
     }
 
     // ------------------------------------------------------------
-    //  scheduleFlush
-    //  - 使用 requestAnimationFrame 將多次事件合併成一次 flush
+    //  scheduleFlush (private)
+    //  - 使用 requestAnimationFrame 將多次事件合併成一次 flush，避免「重算/重繪風暴」
+    //    - 如果有 rAF: 在下個 frame flush
+    //    - 如果沒有 rAF: 用 setTimeout 模擬
+    //
+    //  Input: (void) 
+    //
+    //  Output:
+    //  - 設定 hasScheduledFlush = true
+    //  - 設定 scheduledFlushHandle 與 scheduledFlushKind
     // ------------------------------------------------------------
     private scheduleFlush(): void {
         if (this.hasScheduledFlush) {
@@ -710,27 +785,34 @@ export class ConsumerOptController {
             });
             return;
         } 
-        
-        // else {
-        //     // fallback: 用 16ms 模擬 1 幀
-        //     this.scheduledFlushHandle = window.setTimeout(() => {
-        //         this.flushScheduled();
-        //     } ,16);
-        // }
 
-        // fallback: 用 timeout 模擬
-        // 紀錄 kind，方便取消
+        // fallback: 用 timeout 模擬 (用 16ms 模擬 1 幀)
+        // - 不用 window.setTimeout，改用 setTimeout（在 tests/某些環境更穩）
+        //   測試環境/SSR 可能沒有 window
         this.scheduledFlushKind = "timeout";
-
-        this.scheduledFlushHandle = window.setTimeout(()=>{
-            this.flushScheduled()
-        } ,16);
+        this.scheduledFlushHandle = setTimeout(() => {
+            this.flushScheduled();
+        }, 16) as unknown as number;
     }
 
     // ------------------------------------------------------------
-    //  flushScheduled
-    //  - rAF callback: 真正執行 build + notify 的地方
+    //  flushScheduled (private)
+    //  - rAF callback: 真正執行 build cache + notify listeners 的地方
+    //    這裡「唯一應該會重建 scene 的地方」，除了首次 getter sync build
     //  - 一個 frame 最多呼叫 1 次
+    // 
+    //  - 若不 dirty 且 lastScene 已存在 → return（避免無效 flush）
+    //    rebuild 後若 lastScene null → throw（fail fast）
+    //    通知用 notifyListeners（每個 listener 拿到 clone）
+    //  
+    //  Input: (void)
+    //  - 會讀取 controller state
+    //  
+    //  Output: (void)
+    //  - 清排程狀態
+    //    若 dirty → rebuildCache()
+    //    清除 dirty
+    //    通知 listeners
     // ------------------------------------------------------------
     private flushScheduled(): void {
         // 清除排成狀態
@@ -757,32 +839,30 @@ export class ConsumerOptController {
         // 清除 dirty
         this.heavyDirty = false;
         this.lightDirty = false;
-        this.pendingKind = null;
 
         // 通知 view (安全: snapshot + clone scene)
         // this.notifyListeners(this.lastScene);
-        this.notifyListenersSafely(this.lastScene);
+        this.notifyListeners(this.lastScene);
     }
 
-    // // ------------------------------------------------------------
-    // //  notifyListeners
-    // //  - pub/sub 對外通知
-    // // ------------------------------------------------------------
-    // private notifyListeners(scene: SceneOutput): void {
-    //     let listenerIndex = 0;
-    //     while (listenerIndex < this.listeners.length) {
-    //         const fn = this.listeners[listenerIndex];
-    //         fn(scene);
-    //         listenerIndex++;
-    //     }
-    // }
-
     // ------------------------------------------------------------
-    //  notifyListenersSafely
-    //  - listeners 跌代時可能被 subscribe/unsubscribe 改動 → 行為不可預期
+    //  notifyListeners
+    //  - listeners 遍歷時可能被 subscribe/unsubscribe 改動 → 行為不可預期
     //  - 不能把 cache scene 原封不動丟出去 → 避免 cache 汙染
+    //
+    //  - listenerSnapshot = this.listeners.slice()
+    //  - 對每個 listener:
+    //    - sceneForListener = cloneSceneOutput(cacheScene)
+    //    - dev 模式 freeze (抓 mutation)
+    //    - 呼叫 fn(sceneForListener)
+    //
+    //  Input: cacheScene: SceneOutput
+    //  - Controller 內部 cache 的 scen (不可直接外洩)
+    //
+    //  Output:(void)
+    //  - 呼叫每個 listener
     // ------------------------------------------------------------
-    private notifyListenersSafely(cacheScene: SceneOutput): void {
+    private notifyListeners(cacheScene: SceneOutput): void {
         // snapshot listeners，避免遍歷中被改動
         const listenersSnapshot = this.listeners.slice();
         
@@ -819,19 +899,22 @@ export class ConsumerOptController {
     //    - controlOptions / labelOffsets 做 shallow copy 當成一次 build 的快照
     //    - 這可避免未來 builder refactor 時意外持有 controller state 的 reference 
     //
-    //  Input: 
+    //  Input: (void)
     //  - none（但會讀 this.model / this.options / this.labelOffsets）
     //  
-    //  Output: 
-    //  - void
-    //  - 不回傳值，僅用來更新 (cache) this.lastScene / this.lastViewport
+    //  Output: (void)
+    //  - 更新 this.lastScene
+    //  - 更新 this.lastViewport
     // ------------------------------------------------------------
     private rebuildCache(): void {
         // 建立一次 build 的快照 (shallow copy)
-        const controlViewOptionsSnapshot: ConsumerViewOptions = { ...this.controlViewOptions };
+        const controlViewOptionsSnapshot: ConsumerViewOptions = { 
+            ...this.controlViewOptions 
+        };
 
         // labelOffsets snapshot，必須 clone value 物件，避免 reference leakage
-        const labelOffsetsSnapshot: Partial<Record<LabelKey, PixelOffset>> = cloneLabelOffsets(this.labelOffsets);
+        const labelOffsetsSnapshot: Partial<Record<LabelKey, PixelOffset>> = 
+            cloneLabelOffsets(this.labelOffsets);
 
         // builder.build 的 input：
         // - options：渲染控制（顯示哪些元素、字體大小、顏色等）
@@ -857,7 +940,19 @@ export class ConsumerOptController {
     // ------------------------------------------------------------
     //  rebuildCacheSync
     //  - 只用「cache 尚未建立」時的同步保底
-    //  - [CHANGED] 避免 getter 在未 build 時直接炸掉，但不主動 notify (notify 交給 flush)
+    //  - [CHANGED] 避免 getter 在未 build 時直接炸掉，但不主動 notify (notify 交給 flush) ????
+    //
+    //  - cancelScheduledFlushIfAny(): 避免同 frame flush 又跑一次
+    //    rebuildCache()
+    //    heavyDirty/lightDirty = false
+    //    hasScheduledFlush = false
+    //
+    //  Input: (void)
+    //
+    //  Output: (void)
+    //  - 取消已排程 flush (避免 double build)
+    //    rebuildCache
+    //    清除 dirty
     // ------------------------------------------------------------
     private rebuildCacheSync(): void {
         // 若已經有排程 flush，但我們現在又被迫同步 build（通常發生在第一次 getScene/getViewport）
@@ -869,28 +964,30 @@ export class ConsumerOptController {
         // 同步 sync build 後，cache 已存在，dirty 清掉
         this.heavyDirty = false;
         this.lightDirty = false;
-        this.pendingKind = null;
         this.hasScheduledFlush = false;
     }
 
     // ------------------------------------------------------------
-    // cancelScheduledFlushIfAny
-    // - 取消已排程的 rAF / timeout（避免 double build）
+    //  cancelScheduledFlushIfAny (private)
+    //  - 取消已排程的 rAF / timeout（避免 double build）
+    // 
+    //  - 在「被迫同步 build」前，把已排程的 flush 取消掉，避免:
+    //    同一個 frame: 先 sync build → 下一 frame flush 又 build 一次（浪費）
+    //
+    //  - scheduledFlushKind === "rAF" → cancelAnimationFrame(handle)
+    //  - scheduledFlushKind ==== "timeout" → clearTimeout(handle)
+    //  - reset handle/kind/flag
+    //
+    //  Input: (void)
+    //  
+    //  Output: (void)
+    //  - 若有排成: 取消 rAF 或 timeout，並且 reset state
     // ------------------------------------------------------------
     private cancelScheduledFlushIfAny(): void {
         if (this.scheduledFlushHandle === null) {
             return;
         }
-
-        // const hasCancelRAF = typeof cancelAnimationFrame === "function";
-        // if (hasCancelRAF) {
-        //     // rAF handle
-        //     cancelAnimationFrame(this.scheduledFlushHandle);
-        // } else {
-        //     // timeout handle
-        //     window.clearTimeout(this.scheduledFlushHandle);
-        // }
-
+        
         // 根據 kind 正確取消，避免取消不到
         if (this.scheduledFlushKind === "raf") {
             const hasCancelRAF = typeof cancelAnimationFrame === "function";
@@ -899,8 +996,11 @@ export class ConsumerOptController {
             }
         }
 
+        // 不使用 window.clearTimeout，改用 clearTimeout
+        // - 測試環境/SSR 可能沒有 window
+        // - scheduleFlush 用的是 setTimeout（非 window.setTimeout），取消也應對應 clearTimeout
         if (this.scheduledFlushKind === "timeout") {
-            window.clearTimeout(this.scheduledFlushHandle);
+            clearTimeout(this.scheduledFlushHandle as unknown as number);
         }
 
 
@@ -908,39 +1008,6 @@ export class ConsumerOptController {
         this.scheduledFlushKind = null;
         this.hasScheduledFlush = false;
     }
-
-
-    // // ------------------------------------------------------------
-    // //  rebuildAndNotify (private)
-    // //  - rebuildCache 更新快取
-    // //  - 逐一呼叫 listeners，把新的 scene 推給 view
-    // //
-    // //  Input: none
-    // //
-    // //  Output: void
-    // // ------------------------------------------------------------
-    // private rebuildAndNotify() {
-    //     // 更新 cache
-    //     this.rebuildCache();
-
-    //     if (this.lastScene === null) {
-    //         throw new Error(
-    //             "[ConsumerOptController] lastScene is null after rebuildCache()."
-    //         );
-    //     }
-
-    //     // controller 的內部流程，因此直接獲取 cache，不用再次 getScene()
-    //     const scene = this.lastScene;
-
-    //     // while 迭代 listeners，逐一通知
-    //     // 這是 pub/sub：controller 不知道 view 怎麼 render，它只負責把新 scene 丟出去
-    //     let listenerIndex = 0;
-    //     while (listenerIndex < this.listeners.length) {
-    //         const fn = this.listeners[listenerIndex];
-    //         fn(scene);
-    //         listenerIndex++;
-    //     }
-    // }
 }
 
 // ============================================================
@@ -948,9 +1015,13 @@ export class ConsumerOptController {
 // ============================================================
 
 // ------------------------------------------------------------
-// isDevMode
-// - Vite: import.meta.env.DEV
-// - 再提供一個可選 fallback：globalThis.__DEV__
+//  isDevMode
+//  - Vite: import.meta.env.DEV
+//  - 再提供一個可選 fallback：globalThis.__DEV__
+//
+//  - 優先讀 import.meta.env.DEV (Vite)
+//    fallback globalThis.__DEV__
+//    default false
 // ------------------------------------------------------------
 function isDevMode(): boolean {
     // ----------------------------------------------------------
@@ -993,6 +1064,16 @@ function isDevMode(): boolean {
 
 // ------------------------------------------------------------
 //  cloneLabelOffsets：clone 每個 value 物件，避免 reference leakage
+//  - 避免 reference leakage: builder 不應拿到 controller 的 offsets 內部引用
+//
+//  Input: offsets: Partial<Record<LabelKey, PixelOffset>>
+//  - key: label id (LabelKey)
+//  - value: { offsetDx, offsetDy }
+//
+//  Output: 更新後的 Partial<Record<LabelKey, PixelOffset>>
+//  - 每個value 都重新建立物件 (deep-ish 到一層)
+//
+//  保留: 能否直接使用 Recursive 的方法完成???
 // ------------------------------------------------------------
 function cloneLabelOffsets(
     offsets: Partial<Record<LabelKey, PixelOffset>>,
@@ -1005,10 +1086,13 @@ function cloneLabelOffsets(
     let keyIdx = 0;
     while (keyIdx < keys.length) {
         const keyItem = keys[keyIdx] as LabelKey;
-        const v = offsets[keyItem];
+        const valueObject = offsets[keyItem];
 
-        if (v) {
-            out[keyItem] = { offsetDx: v.offsetDx, offsetDy: v.offsetDy };
+        if (valueObject) {
+            out[keyItem] = { 
+                offsetDx: valueObject.offsetDx, 
+                offsetDy: valueObject.offsetDy 
+            };
         }
 
         keyIdx++;
@@ -1018,9 +1102,15 @@ function cloneLabelOffsets(
 }
 
 // ------------------------------------------------------------
-// cloneSceneOutput
-// - 深度 clone scene（至少 clone 到 drawables/points 這些最常被誤改的結構）
-// - 隔離外部對 scene 的 mutation，避免 cache 汙染
+//  cloneSceneOutput
+//  - 深度 clone scene（至少 clone 到 drawables/points 這些最常被誤改的結構）
+//  - 隔離外部對 scene 的 mutation，避免 cache 汙染
+//
+//  Input: scene: SceneOutput
+//
+//  Output:
+//  - clone 後的 SceneOutput: clone drawables array, clnoe xDomain/yDomain tuple/ width/height 直接 copy value
+//
 // ------------------------------------------------------------
 function cloneSceneOutput(scene: SceneOutput): SceneOutput {
     // clone drawables array
@@ -1048,255 +1138,236 @@ function cloneSceneOutput(scene: SceneOutput): SceneOutput {
 }
 
 // ------------------------------------------------------------
-// cloneDrawable
-// - 依 kind 分支 clone
-// - 不使用 break/continue
+//  cloneDrawable
+//  - 支援 cloneSceneOutput: 根據 drawable.kind clone 內部資料，避免外部 mutate 影響 cache
+//
+//  - line/polyline/point/text/mathSvg 各自 clone
+//  - 未知 kind → throw（fail fast）
+//  
+//  Input: d: Drawable (union type)
+//
+//  Output: clone 後的 Drawable
 // ------------------------------------------------------------
-function cloneDrawable(d: Drawable): Drawable {
-    if (d.kind === "line") {
-        const minEndPoint: Point2D = { x: d.minEndPoint.x, y: d.minEndPoint.y };
-        const maxEndPoint: Point2D = { x: d.maxEndPoint.x, y: d.maxEndPoint.y };
-        const dashClone: number[] = d.stroke.dash.slice();
+function cloneDrawable(drawableType: Drawable): Drawable {
+    if (drawableType.kind === "line") {
+        const minEndPoint: Point2D = { 
+            x: drawableType.minEndPoint.x, 
+            y: drawableType.minEndPoint.y 
+        };
+        const maxEndPoint: Point2D = { 
+            x: drawableType.maxEndPoint.x, 
+            y: drawableType.maxEndPoint.y 
+        };
+        const dashClone: number[] = drawableType.stroke.dash.slice();
 
         return {
             kind: "line",
-            id: d.id,
+            id: drawableType.id,
             minEndPoint: minEndPoint,
             maxEndPoint: maxEndPoint,
             stroke: { 
-                width: d.stroke.width, 
+                width: drawableType.stroke.width, 
                 dash: dashClone,
-                color: d.stroke.color 
+                color: drawableType.stroke.color 
             },
         };
     }
 
-    if (d.kind === "polyline") {
-        const pts: Point2D[] = [];
+    if (drawableType.kind === "polyline") {
+        const points: Point2D[] = [];
         let i = 0;
-        while (i < d.points.length) {
-            const p = d.points[i];
-            pts.push({ x: p.x, y: p.y });
+        while (i < drawableType.points.length) {
+            const point = drawableType.points[i];
+            points.push({ x: point.x, y: point.y });
             i++;
         }
 
-        const dashClone: number[] = d.stroke.dash.slice();
+        const dashClone: number[] = drawableType.stroke.dash.slice();
 
         return {
             kind: "polyline",
-            id: d.id,
-            points: pts,
+            id: drawableType.id,
+            points: points,
             stroke: { 
-                width: d.stroke.width, 
+                width: drawableType.stroke.width, 
                 dash: dashClone,
-                color: d.stroke.color 
+                color: drawableType.stroke.color 
             },
         };
     }
 
-    if (d.kind === "point") {
-        const dashClone: number[] = d.stroke.dash.slice();
-
+    if (drawableType.kind === "point") {
+        const dashClone: number[] = drawableType.stroke.dash.slice();
         return {
             kind: "point",
-            id: d.id,
-            center: { x: d.center.x, y: d.center.y },
-            r: d.r,
-            fill: { color: d.fill.color },
+            id: drawableType.id,
+            center: { x: drawableType.center.x, y: drawableType.center.y },
+            r: drawableType.r,
+            fill: { color: drawableType.fill.color },
             stroke: { 
-                width: d.stroke.width, 
+                width: drawableType.stroke.width, 
                 dash: dashClone,
-                color: d.stroke.color 
+                color: drawableType.stroke.color 
             },
         };
     }
 
-    if (d.kind === "text") {
-        // spans 可能是複雜結構：若你希望 100% 安全，可以在此做更深 clone
-        // 目前做「保守 shallow clone」：至少避免 text drawable 本體被改到 cache
-        // let spansClone: any = undefined;
+    if (drawableType.kind === "text") {
+        // spans：逐個 clone，避免外部改到 cache
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         let spansClone: any[] = [];
 
-        // if (d.spans) {
-        //     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        //     const s: any = d.spans as any;
-
-        //     // 若 spans 是 array，做淺層複製，避免 push/pop 汙染
-        //     if (Array.isArray(s)) {
-        //         spansClone = s.slice();
-        //     } else {
-        //         spansClone = s;
-        //     }
-        // }
-
-        // const next: any = {
-        //     kind: "text",
-        //     id: d.id,
-        //     pos: { x: d.pos.x, y: d.pos.y },
-        //     text: d.text,
-        //     fontSize: d.fontSize,
-        //     fill: { color: d.fill.color },
-        // };
-
-        // if (typeof d.draggable === "boolean") {
-        //     next.draggable = d.draggable;
-        // }
-
-        // if (d.spans) {
-        //     next.spans = spansClone;
-        // }
-
-        // return next as Drawable;
-
-        let sIdx = 0;
-        while (sIdx < d.spans.length) {
-        const s = d.spans[sIdx];
-
-        spansClone.push({
-            text: s.text,
-            offsetDx: s.offsetDx,
-            offsetDy: s.offsetDy,
-            baselineShift: s.baselineShift,
-            fontSize: s.fontSize,
-            fontStyle: s.fontStyle,
-            fontWeight: s.fontWeight,
-            kind: s.kind,
-        });
-
-        sIdx++;
+        let spansIdx = 0;
+        while (spansIdx < drawableType.spans.length) {
+            const span = drawableType.spans[spansIdx];
+            spansClone.push({
+                text: span.text,
+                offsetDx: span.offsetDx,
+                offsetDy: span.offsetDy,
+                baselineShift: span.baselineShift,
+                fontSize: span.fontSize,
+                fontStyle: span.fontStyle,
+                fontWeight: span.fontWeight,
+                kind: span.kind,
+            });
+            spansIdx++;
         }
 
         return {
-        kind: "text",
-        id: d.id,
-        pos: { x: d.pos.x, y: d.pos.y },
-        text: d.text,
-        spans: spansClone as any,
-        fontSize: d.fontSize,
-        fill: { color: d.fill.color },
-        draggable: d.draggable,
-        textAnchor: d.textAnchor,
+            kind: "text",
+            id: drawableType.id,
+            pos: { x: drawableType.pos.x, y: drawableType.pos.y },
+            text: drawableType.text,
+            spans: spansClone as any,
+            fontSize: drawableType.fontSize,
+            fill: { color: drawableType.fill.color },
+            draggable: drawableType.draggable,
+            textAnchor: drawableType.textAnchor,
         } as Drawable;
     }
 
-    if (d.kind === "mathSvg") {
+    if (drawableType.kind === "mathSvg") {
         return {
             kind: "mathSvg",
-            id: d.id,
-            pos: { x: d.pos.x, y: d.pos.y },
-            latex: d.latex,
-            fontSize: d.fontSize,
-            fill: { color: d.fill.color },
-            draggable: d.draggable,
-            displayMode: d.displayMode,
+            id: drawableType.id,
+            pos: { x: drawableType.pos.x, y: drawableType.pos.y },
+            latex: drawableType.latex,
+            fontSize: drawableType.fontSize,
+            fill: { color: drawableType.fill.color },
+            draggable: drawableType.draggable,
+            displayMode: drawableType.displayMode,
         };
     }
 
     // 若未來新增 drawable kind，這裡 fail-fast
     // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-    throw new Error("[cloneDrawable] Unknown drawable kind: " + (d as any).kind);
+    throw new Error("[cloneDrawable] Unknown drawable kind: " + (drawableType as any).kind);
 }
 
 // ------------------------------------------------------------
-// deepFreezeSceneOutput
-// - 僅用於 dev：抓任何 mutate（包含 listener 或 debug code）
-// - 這會讓「錯誤更早爆」而不是靜悄悄污染
+//  deepFreezeSceneOutput
+//  - 把 scene 變成不可變 (Object.freeze)，只要任何人嘗試 mutate 就會立刻爆，方便抓 bug
+//
+//  - 僅用於 dev：抓任何 mutate（包含 listener 或 debug code）
+//  - 這會讓「錯誤更早爆」而不是靜悄悄污染
+//
+//  Input: scene: SceneOutput
+//
+//  Output: (void)
+//  - freeze scene、domains、drawables array、並對每個 drawable 做 deepFreezeDrawable
 // ------------------------------------------------------------
 function deepFreezeSceneOutput(scene: SceneOutput): void {
-  // freeze domains
-  Object.freeze(scene.xDomain);
-  Object.freeze(scene.yDomain);
+    // freeze domains
+    Object.freeze(scene.xDomain);
+    Object.freeze(scene.yDomain);
 
-  // freeze drawables contents
-  let i = 0;
-  while (i < scene.drawables.length) {
-    deepFreezeDrawable(scene.drawables[i]);
-    i++;
-  }
+    // freeze drawables contents
+    let sceneDrawableIdx = 0;
+    while (sceneDrawableIdx < scene.drawables.length) {
+        deepFreezeDrawable(scene.drawables[sceneDrawableIdx]);
+        sceneDrawableIdx++;
+    }
 
-  // freeze drawables array
-  Object.freeze(scene.drawables);
+    // freeze drawables array
+    Object.freeze(scene.drawables);
 
-  // freeze scene object itself
-  Object.freeze(scene);
+    // freeze scene object itself
+    Object.freeze(scene);
 }
 
 // ------------------------------------------------------------
-// deepFreezeDrawable
-// - 依 kind freeze 內部結構
+//  deepFreezeDrawable
+//  - 針對不同 kind freeze 內部 nested object (points、stroke、fill、spans 等)
+//
+//  Input: d: Drawable
+//
+//  Output: (void)
+//  - freeze drawable 的所有可變 nested 結構
 // ------------------------------------------------------------
 function deepFreezeDrawable(d: Drawable): void {
-  if (d.kind === "line") {
-    Object.freeze(d.minEndPoint);
-    Object.freeze(d.maxEndPoint);
+    if (d.kind === "line") {
+        Object.freeze(d.minEndPoint);
+        Object.freeze(d.maxEndPoint);
 
-    // stroke + dash
-    Object.freeze(d.stroke.dash);
-    Object.freeze(d.stroke);
+        // stroke + dash
+        Object.freeze(d.stroke.dash);
+        Object.freeze(d.stroke);
 
-    Object.freeze(d);
-    return;
-  }
-
-  if (d.kind === "polyline") {
-    let i = 0;
-    while (i < d.points.length) {
-      Object.freeze(d.points[i]);
-      i++;
-    }
-    Object.freeze(d.points);
-
-    Object.freeze(d.stroke.dash);
-    Object.freeze(d.stroke);
-
-    Object.freeze(d);
-    return;
-  }
-
-  if (d.kind === "point") {
-    Object.freeze(d.center);
-    Object.freeze(d.fill);
-
-    Object.freeze(d.stroke.dash);
-    Object.freeze(d.stroke);
-
-    Object.freeze(d);
-    return;
-  }
-
-  if (d.kind === "text") {
-    Object.freeze(d.pos);
-    Object.freeze(d.fill);
-
-    // // spans：如果是 array，freeze 容器；內容是否需要 freeze 視你的 spans 結構而定
-    // // 這裡保守處理：若 spans 是 array，freeze array 本體
-    // // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    // const anyD: any = d as any;
-    // if (anyD.spans && Array.isArray(anyD.spans)) {
-    //   Object.freeze(anyD.spans);
-    // }
-
-    // spans：freeze 每個 span，再 freeze array
-    let i = 0;
-    while (i < d.spans.length) {
-      Object.freeze(d.spans[i]);
-      i++;
-    }
-    Object.freeze(d.spans);
-
-    Object.freeze(d);
-    return;
-  }
-
-    if (d.kind === "mathSvg") {
-        Object.freeze(d.pos);
-        Object.freeze(d.fill);
         Object.freeze(d);
         return;
     }
 
-  // 未知 kind：fail-fast
-  // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-  throw new Error("[deepFreezeDrawable] Unknown drawable kind: " + (d as any).kind);
+    if (d.kind === "polyline") {
+        let i = 0;
+        while (i < d.points.length) {
+        Object.freeze(d.points[i]);
+        i++;
+        }
+        Object.freeze(d.points);
+
+        Object.freeze(d.stroke.dash);
+        Object.freeze(d.stroke);
+
+        Object.freeze(d);
+        return;
+    }
+
+    if (d.kind === "point") {
+        Object.freeze(d.center);
+        Object.freeze(d.fill);
+
+        Object.freeze(d.stroke.dash);
+        Object.freeze(d.stroke);
+
+        Object.freeze(d);
+        return;
+    }
+
+    if (d.kind === "text") {
+        Object.freeze(d.pos);
+        Object.freeze(d.fill);
+
+        // spans：freeze 每個 span，再 freeze array
+        let i = 0;
+        while (i < d.spans.length) {
+            Object.freeze(d.spans[i]);
+            i++;
+        }
+        Object.freeze(d.spans);
+
+        Object.freeze(d);
+        return;
+    }
+
+        if (d.kind === "mathSvg") {
+            Object.freeze(d.pos);
+            Object.freeze(d.fill);
+            Object.freeze(d);
+            return;
+        }
+
+    // 未知 kind：fail-fast
+    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+    throw new Error("[deepFreezeDrawable] Unknown drawable kind: " + (d as any).kind);
 }
 
