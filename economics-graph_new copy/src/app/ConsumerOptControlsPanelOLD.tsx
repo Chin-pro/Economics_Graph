@@ -1,0 +1,564 @@
+// src/app/ConsumerOptControlsPanel.tsx
+
+// ------------------------------------------------------------
+//  ControlsPanel：純 UI 控制面板
+//  - 只負責把 state 渲染成 UI (checkbox、slider、input、select...)
+//  - 使用 props 的 callback 把使用這操作回傳給上層
+//
+//  Scope:
+//  - 不 new controller/model
+//  - 不處理 scene build
+// ------------------------------------------------------------
+
+import React from "react";
+import { ControlledSlider } from "../common/ControlledSlider";
+import type { ConsumerViewOptions } from "../core/types";
+
+// ------------------------------------------------------------
+//  允許的 ticks 選項（離散值）
+//  - 用於 select 下拉選單
+//  - onChange 時也會做合法性檢查，避免傳入任意值
+// ------------------------------------------------------------
+const ALLOWED_TICKS: number[] = [1, 2, 4, 5, 10];
+
+// ------------------------------------------------------------
+//  ControlsState：ControlsPanel 所需的完整 UI 狀態
+//  - 這是「受控元件」的資料來源（Single Source of Truth）
+//  - 上層通常會用 setState / reducer 來維護它
+// ------------------------------------------------------------
+// export type ControlsState = {
+//     // model parameters
+//     I: number;         // Income
+//     exponent: number;  // alpha（效用函數的 x 指數，例如 Cobb-Douglas 的 a）
+//     px: number;        // x 價格
+//     py: number;        // y 價格
+
+//     // 坐標軸 / 刻度 UI
+//     ticks: number;     // 刻度數量（限制在 ALLOWED_TICKS）
+//     showTickLines: boolean;
+//     showTickLabels: boolean;
+//     xLabel: string;    // 於 X 軸 顯示的文字
+//     yLabel: string;    // 於 Y 軸 顯示的文字
+
+//     // 圖表標題 UI
+//     chartTitle: string;          // 標題文字
+//     showXLabel: boolean;         // 是否顯示 X 標籤
+//     showYLabel: boolean;         // 是否顯示 Y 標籤
+
+//     showChartTitle: boolean;     // 是否顯示標題
+//     chartTitleFontSize: number;  // 標題字體大小
+
+//     exportFileName: string;      // 匯出檔名
+
+//     // view options（會同步到 controller，表示 UI 改變會影響圖形渲染）
+//     // 視覺層 (顏色、方程式字體大小、是否顯示 Opt/Equation labels...)
+//     viewOptions: ConsumerViewOptions;
+// };
+
+
+// ------------------------------------------------------------
+//  model params：經濟模型參數（通常會觸發 heavy rebuild）
+// ------------------------------------------------------------
+export type ModelParams = {
+    I: number;          // Income（收入）
+    exponent: number;   // alpha（效用函數 x 指數）
+    px: number;         // x 的價格
+    py: number;         // y 的價格
+};
+
+// ------------------------------------------------------------
+//  tick config：刻度相關（ticks 與顯示）
+// ------------------------------------------------------------
+export type TickConfig = {
+    ticks: number; // 刻度數量（限制在 ALLOWED_TICKS）
+    showTickLines: boolean; // 是否顯示刻度線
+    showTickLabels: boolean; // 是否顯示刻度文字
+};
+
+// ------------------------------------------------------------
+//  axis labels：軸標籤與顯示開關
+// ------------------------------------------------------------
+export type AxisLabelConfig = {
+    xLabel: string; // X 軸顯示文字（例如 "x" 或 "Food"）
+    yLabel: string; // Y 軸顯示文字（例如 "y" 或 "Clothing"）
+    showXLabel: boolean; // 是否顯示 X 軸變數名稱
+    showYLabel: boolean; // 是否顯示 Y 軸變數名稱
+};
+
+// ------------------------------------------------------------
+//  title config：圖表標題與字級
+// ------------------------------------------------------------
+export type TitleConfig = {
+    chartTitle: string; // 圖表標題文字
+    showChartTitle: boolean; // 是否顯示圖表標題
+    chartTitleFontSize: number; // 標題字級
+};
+
+// ------------------------------------------------------------
+//  export config：匯出相關
+// ------------------------------------------------------------
+export type ExportConfig = {
+    exportFileName: string; // 匯出檔名（例如 "consumer-opt.svg"）
+};
+
+// ------------------------------------------------------------
+//  ControlsState：巢狀分群的總狀態
+//  - 注意：viewOptions 仍保留在最上層，因為它是一組「同步到 controller」的視覺設定
+// ------------------------------------------------------------
+export type ControlsState = {
+  model: ModelParams; // 經濟模型參數群
+  tick: TickConfig; // 刻度設定群
+  axis: AxisLabelConfig; // 軸標籤群
+  title: TitleConfig; // 標題群
+  export: ExportConfig; // 匯出群
+
+  // view options（會同步到 controller）
+  viewOptions: ConsumerViewOptions; // 視覺渲染群（顏色、方程式字級、顯示 opt 等）
+};
+
+
+
+
+// ------------------------------------------------------------
+//  ConsumerOptControlsPanel (主元件)
+//  Input:
+//  1. state: ControlsState
+//   - Input：控制面板所有顯示都由它決定（典型受控元件模式）
+//
+//  2. onChangeState(patch)
+//   - 通知上層「請把 state 合併 patch」
+//   - Input：Partial<ControlsState>，只帶要改的欄位
+//   - Output：void（副作用由上層處理，例如 setState + 同步 controller）
+//
+//  3. onChangeTicks(ticks)
+//   - ticks 可能需要上層做「額外行為」（例如：重新算 tick positions 或觸發 scene rebuild）
+//     所以獨立一個 handler
+//   - Input：ticks（已被驗證在允許範圍內）
+//
+//  4. onIncomeChange / onAlphaChange / onPxChange / onPyChange
+//   - 直接對 model params 做更新（通常會觸發 heavy rebuild）
+//   - Input：對應數值
+//  
+//  5. onViewOptionsChange(patch)
+//   - 視覺變更通常走 light patch 或較輕量更新（依你 controller 設計）
+//   - Input：只修改 ConsumerViewOptions 的部分欄位
+//
+//  6. onExportClick()
+//   - 觸發匯出 SVG（上層應該拿到目前 scene/svg DOM 然後輸出）
+//   - Input：無
+// 
+//  Output:
+//  - 回傳 JSX.Element (React 元件渲染結果)
+// ------------------------------------------------------------
+export default function ConsumerOptControlsPanel(props: {
+  state: ControlsState;    // 輸入資料: 控制面板所有顯示都由它決定(典型受控元件模式)
+
+  onChangeState: (patch: Partial<ControlsState>) => void;
+
+  onChangeTicks: (ticks: number) => void;
+
+  // model params
+  onIncomeChange: (I: number) => void;
+  onAlphaChange: (a: number) => void;
+  onPxChange: (px: number) => void;
+  onPyChange: (py: number) => void;
+
+  // view options
+  onViewOptionsChange: (patch: Partial<ConsumerViewOptions>) => void;
+
+  onExportClick: () => void;
+}) {
+  const s = props.state;
+
+  return (
+    // 外層容器：固定寬度的側邊欄樣式，垂直排列區塊
+    <div style={{ 
+        width: 340,                   // 面板固定寬度 (側邊欄)
+        display: "flex",              // 重直堆疊
+        flexDirection: "column", 
+        gap: 14                       // 每個區塊之間的距離
+    }}>
+        <h3 style={{ margin: 0 }}>Controls Panel</h3>
+            
+        {/* ------------------------------------------------------
+            Visibility：顯示/隱藏相關選項
+            - 有些欄位屬於 s.viewOptions（同步到 controller）
+            - 有些欄位屬於 s（單純 UI state）
+            ------------------------------------------------------ */}
+        <div style={{ padding: 10, border: "1px solid #eee", borderRadius: 8 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Visibility</div>
+
+            <label style={{ display: "block", marginBottom: 6 }}>
+                <input
+                    type="checkbox"
+                    checked={s.viewOptions.showEquationLabels}  // 由 state 決定 → 受控 checkbox
+                    onChange={(e) => 
+                        // Input: e.currentTarget.checked 是 boolean
+                        // Output: 呼叫 onViewOptionsChange(...)，回報 patch
+                        props.onViewOptionsChange({ showEquationLabels: e.currentTarget.checked })
+                    }
+                />
+                {" "}顯示方程式文字標籤
+            </label>
+            
+            {/* 顯示最適點（Opt：點 + 文字）（viewOptions） */}
+            <label style={{ display: "block", marginBottom: 6 }}>
+                <input
+                    type="checkbox"
+                    checked={s.viewOptions.showOpt}
+                    onChange={(e) => props.onViewOptionsChange({ showOpt: e.currentTarget.checked })}
+                />
+                {" "}顯示 Opt（點 + 文字）
+            </label>
+            
+            {/* 顯示 X 軸變數名稱（UI state） */}
+            <label style={{ display: "block", marginBottom: 6 }}>
+                <input
+                    type="checkbox"
+                    checked={s.axis.showXLabel}
+                    // onChange={(e) => props.onChangeState({ showXLabel: e.currentTarget.checked })}
+                    onChange={(e) => {
+                        // [CHANGED] 由於 state 巢狀化，必須 patch 整個 axis group（淺層 patch）
+                        // 原因：onChangeState 是 Partial<ControlsState>，對 axis 來說是整個物件
+                        props.onChangeState({
+                            axis: {
+                            ...s.axis, // 保留 axis 其他欄位
+                            showXLabel: e.currentTarget.checked, // 只更新 showXLabel
+                            },
+                        });
+                    }}
+                />
+                {" "}顯示 X 軸變數名稱
+            </label>
+            
+            {/* 顯示 Y 軸變數名稱（UI state） */}
+            <label style={{ display: "block", marginBottom: 6 }}>
+                <input
+                    type="checkbox"
+                    checked={s.axis.showYLabel}
+                    // onChange={(e) => props.onChangeState({ showYLabel: e.currentTarget.checked })}
+                    onChange={(e) => {
+                        props.onChangeState({
+                            axis: {
+                            ...s.axis,
+                            showYLabel: e.currentTarget.checked,
+                            },
+                        });
+                    }}
+                />
+                {" "}顯示 Y 軸變數名稱
+            </label>
+            
+            {/* 顯示圖片標題（UI state） */}
+            <label style={{ display: "block" }}>
+                <input
+                    type="checkbox"
+                    checked={s.title.showChartTitle}
+                    // onChange={(e) => props.onChangeState({ showChartTitle: e.currentTarget.checked })}
+                    onChange={(e) => {
+                        props.onChangeState({
+                            axis: {
+                                ...s.axis,
+                                showYLabel: e.currentTarget.checked,
+                            },
+                        });
+                    }}
+                />
+                {" "}顯示圖片標題
+            </label>
+        </div>
+        
+        
+        {/* ------------------------------------------------------
+            Font sizes：字級設定
+            - equationFontSize 在 viewOptions（同步到 controller）
+            - chartTitleFontSize 在 ControlsState（UI/匯出相關）
+            ------------------------------------------------------ */}
+        <div style={{ padding: 10, border: "1px solid #eee", borderRadius: 8 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Font sizes</div>
+            {/* 方程式標籤字級（viewOptions.equationFontSize） */}
+            <ControlledSlider
+                label="Equation label font"   // 顯示名稱
+                min={8}      // 最小值
+                max={24}     // 最大值
+                step={1}     // 步長
+                value={s.viewOptions.labelFontSize}  // 受控值
+                onChange={(next) => 
+                    // Input: next 是 number
+                    // Output: 回報 viewOptions patch
+                    props.onViewOptionsChange({ labelFontSize: next })
+                }
+            />
+            {/* 標題字級（title.chartTitleFontSize） */}
+            <ControlledSlider
+                label="Title font"
+                min={10}
+                max={26}
+                step={1}
+                value={s.title.chartTitleFontSize}
+                // onChange={(next) => props.onChangeState({ chartTitleFontSize: next })}
+                onChange={(next) => {
+                    props.onChangeState({
+                        title: {
+                            ...s.title,
+                            chartTitleFontSize: next, // 只更新字級
+                        },
+                    });
+                }}
+            />
+        </div>
+        
+        {/* ------------------------------------------------------
+          Chart title：標題文字輸入（title.chartTitle）
+         ------------------------------------------------------ */}
+        <div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Chart title</div>
+            <input
+                value={s.title.chartTitle}
+                // onChange={(e) => props.onChangeState({ chartTitle: e.currentTarget.value })}
+                onChange={(e) => {
+                    props.onChangeState({
+                        title: {
+                            ...s.title,
+                            chartTitle: e.currentTarget.value, // Input: string
+                        },
+                    });
+                }}
+                style={{ width: "100%" }}  // 寬度填滿
+            />
+        </div>
+        
+        {/* ------------------------------------------------------
+          Export：匯出檔名 + 匯出按鈕（export.exportFileName）
+         ------------------------------------------------------ */}
+        <div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Export file name</div>
+            <input
+                value={s.export.exportFileName}
+                // onChange={(e) => props.onChangeState({ exportFileName: e.currentTarget.value })}
+                onChange={(e) => {
+                    props.onChangeState({
+                        export: {
+                            ...s.export,
+                            exportFileName: e.currentTarget.value,
+                        },
+                    });
+                }}
+                style={{ width: "100%" }}
+            />
+            <button
+                onClick={() => {
+                    // Input: 無
+                    // Output: 呼叫 onExportClick（實際匯出由上層負責）
+                    props.onExportClick();
+                }}
+                style={{ marginTop: 8 }}
+            >
+                Export SVG
+            </button>
+        </div>
+
+        {/* ------------------------------------------------------
+          X/Y 軸標籤文字（axis.xLabel / axis.yLabel）
+         ------------------------------------------------------ */}
+        <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>X-axis label</div>
+                <input
+                    value={s.axis.xLabel}
+                    // onChange={(e) => props.onChangeState({ xLabel: e.currentTarget.value })}
+                    onChange={(e) => {
+                        props.onChangeState({
+                            axis: {
+                                ...s.axis,
+                                xLabel: e.currentTarget.value,
+                            },
+                        });
+                    }}
+                    style={{ width: "100%" }}
+                />
+            </div>
+            <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Y-axis label</div>
+                <input
+                    value={s.axis.yLabel}
+                    // onChange={(e) => props.onChangeState({ yLabel: e.currentTarget.value })}
+                    onChange={(e) => {
+                        props.onChangeState({
+                            axis: {
+                                ...s.axis,
+                                yLabel: e.currentTarget.value,
+                            },
+                        });
+                    }}
+                    style={{ width: "100%" }}
+                />
+            </div>
+        </div>
+
+        {/* ------------------------------------------------------
+          ticks：刻度設定
+          - select 只能選 ALLOWED_TICKS
+          - onChange 時再次驗證，合法才呼叫 onChangeTicks(raw)
+         ------------------------------------------------------ */}
+        <div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Ticks</div>
+            <select
+            value={s.tick.ticks}
+            onChange={(e) => {
+                // select 的 value 原生是 string，轉成 number
+                const raw = Number(e.currentTarget.value);
+
+                // 驗證：raw 必須在 ALLOWED_TICKS 內
+                // 注意：不用 break/continue，因此用 ok flag + while
+                let ok = false;
+                let tickIdX = 0;
+                while (tickIdX < ALLOWED_TICKS.length) {
+                    if (ALLOWED_TICKS[tickIdX] === raw) {
+                        ok = true;
+                    }
+                    tickIdX ++;
+                }
+
+                // 合法才通知上層（避免不預期值）
+                if (ok) {
+                    props.onChangeTicks(raw);
+                }
+            }}
+            style={{ width: "100%" }}
+            >
+            {ALLOWED_TICKS.map((v) => (
+                <option key={"ticks-" + v} value={v}>
+                {v}
+                </option>
+            ))}
+            </select>
+
+            {/* ticks 的顯示選項 */}
+            <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+            <label>
+                <input
+                    type="checkbox"
+                    checked={s.tick.showTickLines}
+                    // onChange={(e) => props.onChangeState({ showTickLines: e.currentTarget.checked })}
+                    onChange={(e) => {
+                        props.onChangeState({
+                            tick: {
+                                ...s.tick,
+                                showTickLines: e.currentTarget.checked,
+                            },
+                        });
+                    }}
+                />
+                顯示刻度線
+            </label>
+            
+            {/* 顯示刻度文字（tick.showTickLabels） */}
+            <label>
+                <input
+                    type="checkbox"
+                    checked={s.tick.showTickLabels}
+                    // onChange={(e) => props.onChangeState({ showTickLabels: e.currentTarget.checked })}
+                    onChange={(e) => {
+                        props.onChangeState({
+                            tick: {
+                                ...s.tick,
+                                showTickLabels: e.currentTarget.checked,
+                            },
+                        });
+                    }}
+                />
+                顯示刻度文字
+            </label>
+            </div>
+        </div>
+        
+        {/* 顏色：Budget / Indiff（viewOptions） */}
+        <div style={{ display: "flex", gap: 12 }}>
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            Budget color
+            <input
+                type="color"
+                value={s.viewOptions.budgetColor}
+                onChange={(e) => props.onViewOptionsChange({ budgetColor: e.currentTarget.value })}
+            />
+            </label>
+
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            Indiff color
+            <input
+                type="color"
+                value={s.viewOptions.indiffColor}
+                onChange={(e) => props.onViewOptionsChange({ indiffColor: e.currentTarget.value })}
+            />
+            </label>
+        </div>
+        
+        {/* 顏色：Opt point / Opt text（viewOptions） */}
+        <div style={{ display: "flex", gap: 12 }}>
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            Opt point
+            <input
+                type="color"
+                value={s.viewOptions.optPointColor}
+                onChange={(e) => props.onViewOptionsChange({ optPointColor: e.currentTarget.value })}
+            />
+            </label>
+
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            Opt text
+            <input
+                type="color"
+                value={s.viewOptions.optTextColor}
+                onChange={(e) => props.onViewOptionsChange({ optTextColor: e.currentTarget.value })}
+            />
+            </label>
+        </div>
+        
+        {/* ------------------------------------------------------
+          model params：四個 slider
+          - Income / alpha / px / py
+          - 這些通常會由上層同步到 controller → heavy rebuild
+         ------------------------------------------------------ */}
+        <ControlledSlider
+            label="Income I"
+            min={5}
+            max={60}
+            value={s.model.I}
+            onChange={(nextI) => 
+                // Input: nextI number
+                // Output: 呼叫 onIncomeChange（上層負責更新 state / controller）
+                props.onIncomeChange(nextI)
+            }  // 更新 model 的 I，通常會觸發重算（heavy）
+        />
+
+        <ControlledSlider
+            label="a (x exponent)"
+            min={0.1}
+            max={0.9}
+            step={0.01}
+            // 顯示時把 a 固定到小數 2 位，避免浮點抖動造成 UI 顯示不穩
+            value={Number(s.model.exponent.toFixed(2))}
+            onChange={(nextA) => props.onAlphaChange(nextA)}
+        />
+
+        <ControlledSlider
+            label="Price px"
+            value={s.model.px}
+            min={0.1}
+            max={5}
+            step={0.1}
+            onChange={(nextPx) => props.onPxChange(nextPx)}
+        />
+
+        <ControlledSlider
+            label="Price py"
+            value={s.model.py}
+            min={0.1}
+            max={5}
+            step={0.1}
+            onChange={(nextPy) => props.onPyChange(nextPy)}
+        />
+        </div>
+    );
+}
