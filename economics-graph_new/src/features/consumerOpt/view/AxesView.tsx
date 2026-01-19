@@ -1,13 +1,13 @@
 // src/mvc/view/AxesView.tsx
 
 // ------------------------------------------------------------
-// View 層（React）元件：AxesView
-// 任務：只負責「把座標軸畫出來」
+// AxesView: View 層（React）元件
+// - 只負責「把座標軸畫出來」
 // - 不做任何經濟計算
 // - 不做狀態管理
 // - 不依賴 Model/Controller
 //
-// 加入「五等分刻度」與「刻度文字」
+// - 加入「五等分刻度」與「刻度文字」
 //
 // 這是典型 MVC 裡 View 的「純渲染元件」：
 // Controller/GraphView 算好 innerW/innerH + margin 後，丟給它畫。
@@ -24,11 +24,11 @@ import { Viewport } from "../../../core/viewport";
 
 // 匯入 刻度生成工具
 import {
-  buildXTicks,
-  buildYTicks,
-  normalizeTicks,
-  type TickStyle,
-  type TickVisibility,
+    buildXTicks,
+    buildYTicks,
+    normalizeTicks,
+    type TickStyle,
+    type TickVisibility,
 } from "./axesTicks"
 
 
@@ -245,15 +245,15 @@ export class AxesView extends React.Component<Props> {
         let xLabelNode: React.ReactNode = null;
         if (showX) {
             xLabelNode = (
-            <text
-                x={xLabelCenterX}
-                y={xAxisYPixel + style.tickLen + style.fontSize * 2 + X_LABEL_EXTRA_PADDING}
-                fontSize={xLabelFontSize}
-                textAnchor="middle"
-                fill="currentColor"
-            >
-                {xLabel}
-            </text>
+                <text
+                    x={xLabelCenterX}
+                    y={xAxisYPixel + style.tickLen + style.fontSize * 2 + X_LABEL_EXTRA_PADDING}
+                    fontSize={xLabelFontSize}
+                    textAnchor="middle"
+                    fill="currentColor"
+                >
+                    {xLabel}
+                </text>
             );
         }
 
@@ -262,46 +262,46 @@ export class AxesView extends React.Component<Props> {
         let yLabelNode: React.ReactNode = null;
         if (showY) {
             yLabelNode = (
-            <text
-                x={yLabelX}
-                y={yLabelCenterY}
-                fontSize={yLabelFontSize}
-                textAnchor="middle"
-                fill="currentColor"
-                // transform={`rotate(-90 ${yLabelX} ${yLabelCenterY}`}
-            >
-                {yLabel}
-            </text>
+                <text
+                    x={yLabelX}
+                    y={yLabelCenterY}
+                    fontSize={yLabelFontSize}
+                    textAnchor="middle"
+                    fill="currentColor"
+                    // transform={`rotate(-90 ${yLabelX} ${yLabelCenterY}`}
+                >
+                    {yLabel}
+                </text>
             );
         }
 
         return (
             <g transform={`translate(${margin.left + offset.x},${margin.top + offset.y})`}>
-            {/* x-axis（水平線） */}
-            <line
-                x1={0}
-                y1={xAxisYPixel}
-                x2={svgInnerWidth}
-                y2={xAxisYPixel}
-                stroke="currentColor"
-            />
+                {/* x-axis（水平線） */}
+                <line
+                    x1={0}
+                    y1={xAxisYPixel}
+                    x2={svgInnerWidth}
+                    y2={xAxisYPixel}
+                    stroke="currentColor"
+                />
 
-            {/* y-axis（垂直線） */}
-            <line
-                x1={yAxisXPixel}
-                y1={0}
-                x2={yAxisXPixel}
-                y2={svgInnerHeight}
-                stroke="currentColor"
-            />
+                {/* y-axis（垂直線） */}
+                <line
+                    x1={yAxisXPixel}
+                    y1={0}
+                    x2={yAxisXPixel}
+                    y2={svgInnerHeight}
+                    stroke="currentColor"
+                />
 
-            {/* ticks */}
-            {xTickNodes}
-            {yTickNodes}
+                {/* ticks */}
+                {xTickNodes}
+                {yTickNodes}
 
-            {/* axis labels */}
-            {xLabelNode}
-            {yLabelNode}
+                {/* axis labels */}
+                {xLabelNode}
+                {yLabelNode}
             </g>
         );
     }

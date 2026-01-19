@@ -1,8 +1,17 @@
 // src/features/consumerOpt/ui/ConsumerOptRoot.tsx
+
 // ------------------------------------------------------------
 // ConsumerOptRoot (Feature Root UI): consumerOpt feature 的 UI 組裝點
 // - 左側：ConsumerOptControlsPanel (純 UI: slider/checkbox，產出 patch/callback)
 // - 右側：ConsumerOptGraphView (圖形 View，訂閱 controller、用 renderer 畫 scene)
+//
+// Heavy: slider -> Root.setState(先更新顯示) -> controller.onXxxChange -> model 更新 
+//        -> scene rebuild -> controller.notify -> Root 收到通知 -> Root pull snapshot 
+//        -> Root.setState(對齊顯示)
+//
+// Light: checkbox -> Root.setState(更新 viewOptions 顯示) 
+//        -> controller.setViewOptions(patch) -> 可能觸發 view refresh/notify（看 controller 設計）
+//
 //
 // SRP / SOLID：
 // - ConsumerOptRoot.tsx 只做「UI 組裝 + UI state wiring + 呼叫 controller」
@@ -52,6 +61,8 @@ import {
 
 // ----------------------------------------------------------
 //  Props
+//  - 將 Root 做成「可插拔」: App/FeatureHost 只要提供 controller，就能 render 這個 feature 的 UI
+//
 //  Input:
 //  - controller: ConsumerOptController
 //    這個 feature 的互動入口（接收 UI 事件、更新 model、重建 scene、通知 subscribers）
@@ -76,6 +87,7 @@ type State = ControlsState;
 //
 //  Output:
 //  - React.ReactNode (ReactElement)：左 Controls + 右 Graph 的 UI
+//  - render 後，graphRef.current 可能指向 ConsumerOptGraphView instance
 // ----------------------------------------------------------
 export class ConsumerOptRoot extends React.Component<Props, State> {
     // 用 ref 拿到 GraphView，才能從左側按鈕呼叫 exportSvg
@@ -126,6 +138,9 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     //  Input: empty
     //
     //  Output: (void)
+    //  - 訂閱 controller: controller.subscribe(listener)
+    //  - 把 viewOptions 推進 controller: controller.setViewOptions(...)
+    //  - 用 snapshot 回寫 UI: this.setState(...)
     // ----------------------------------------------------------
     public componentDidMount(): void {
         const controller = this.props.controller;
@@ -141,25 +156,36 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
 
         // this.setState(...)：回寫入 model
         // 確保訂閱開始後，UI state 立刻跟 model state 對齊，避免極端時序下不同步
-        this.setState({
+        // this.setState({
+        //     model: {
+        //         ...this.state.model,
+        //         I: params.I,
+        //         exponent: params.exponent,
+        //         px: params.px,
+        //         py: params.py,
+        //     },
+        // });
+        this.setState( (prev) => ({
             model: {
-                ...this.state.model,
+                ...prev.model,
                 I: params.I,
                 exponent: params.exponent,
                 px: params.px,
                 py: params.py,
-            },
-        });
+            }
+        }));
     }
 
     // ----------------------------------------------------------
     //  componentWillUnmount：元件卸載時解除訂閱 (卸載前取消訂閱)
     //  - 避免 controller 還在 notify 時呼叫 setState，造成 memory leak 警告
     //  - Root 不是 controller owner，因此不呼叫 controller.dispose()
+    //  - 防止 memory leak / React 警告: unmount 後還 setState
     //
     //  Input: empty
     //
     //  Output: (void)
+    //  - 解除訂閱: controller.unsubscribe(listener)
     // ----------------------------------------------------------
     public componentWillUnmount(): void {
         const controller = this.props.controller;
@@ -170,75 +196,80 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     //  handleSceneUpdateFromController
     //  - UI：scene 更新 → controller → Root 的通知回呼 → 同步 model params 給 slider 顯示
     //  - Root 採用 pull-model: 收到 notify 後，再向 controller 拉取 snapshot
+    //  - Observer / Pub-Sub: 收到 controller 的 notify 後，不直接吃 payload，而是 pull snapshot
+    //    代價: 每次 notify 會多一次 snapshot 讀取
     //
     //  Input: empty
     //
     //  Output:
-    //  - void：透過 setState 同步 model params，更新 UI (slider 顯示)
+    //  - void：透過 setState 更新 state.model，藉此同步 model params，更新 UI (slider 顯示)
     // ----------------------------------------------------------
     private handleSceneUpdateFromController(): void {
         const controller = this.props.controller;
 
         // 從 single source of truth（Controller -> Model snapshot）讀取最新參數快照
-        const p = controller.getModelParamsSnapshot();
+        const params = controller.getModelParamsSnapshot();
 
         // 僅更新 model，其他 UI 不動
-        // [Reserve] 使用 fuctional setState: (prev) => {}，避免連續通知 (drag) 時 state 被舊閉包覆蓋
-        this.setState({
+        // 使用 fuctional setState: (prev) => {}，避免連續通知 (drag) 時 state 被舊閉包覆蓋
+        this.setState( (prev) => ({
             model: {
-                ...this.state.model,
-                I: p.I,
-                exponent: p.exponent,
-                px: p.px,
-                py: p.py,
-            },
-        });
+                ...prev.model,
+                I: params.I,
+                exponent: params.exponent,
+                px: params.px,
+                py: params.py,
+            }
+        }));
     }
 
 
     // ==========================================================
-    // ControlsPanel -> Root：狀態更新（巢狀 patch）
+    //  ControlsPanel -> Root：狀態更新（巢狀 patch）
     // ==========================================================
 
     // ----------------------------------------------------------
     //  handleControlsStatePatch
     //  - ControlsPanel 會把「已經 merge 好的 group」用 patch 形式交給 Root
-    //  - Root 只要把 patch 套進 state（React class setState 會做 top-level shallow merge）
-    // 
+    //  - Root 只要把 patch 套進 state（React class setState 會做 top-level shallow merge） 
+    //
     //  Input:
     //  - patch: Partial<ControlsState>
     //  - 可能只包含 axis/title/tick/export/model/viewOptions 的其中一組或多組
     //
     //  Output: (void)
-    //  - 透過 setState 更新 UI
+    //  - 透過 setState(...) 更新 UI
     // ----------------------------------------------------------
     private handleControlsStatePatch(patch: Partial<ControlsState>): void {
         // patch 通常是某一個 group（axis/title/tick/export/model）
         // 這裡做 top-level merge
-        this.setState({
-            ...this.state,
+        this.setState( (prev) => ({
+            ...prev,
             ...patch,
-        });
+        }));
     }
 
     // ----------------------------------------------------------
     //  handleViewOptionsPatch
     //  - viewOptions 統一入口（LIGHT 更新）
+    //  - State["viewOptions"]: State這個型別裡 viewOption 欄位的型別
+    //    如果 ControlsState.viewOptions 的型別，這裡會自動跟著改變，不需手動同步
     //
     //  Input:
     //  - path: Partial<State["viewOption"]>
+    //    viewOptions 的局部更新 (Ex: { showGrid: true })
     //
     //  Output:
     //  - void: 更新 UI state.viewOptions + 呼叫 controller.setViewOptions(path)
     // ----------------------------------------------------------
     private handleViewOptionsPatch(patch: Partial<State["viewOptions"]>): void {
         // 1) 先更新 UI state (讓 ControlsPanel 顯示一致)
-        this.setState({
+        this.setState( (prev) => ({
             viewOptions: {
-                ...this.state.viewOptions,
+                ...prev.viewOptions,
                 ...patch,
             },
-        });
+        }));
 
         // 2) 再將 path 丟給 controller
         // 由 controller 決定 LIGHT 路徑（目前只更新 viewOptions，不重算 econ）
@@ -253,16 +284,22 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     //  - UI state 先改動，通知 controller 通知「scene 更新」時，讀取最新 model，
     //    並將最新參數同步回 UI state
     // ==========================================================
+
     // ----------------------------------------------------------
     //  handleIncomeChange
+    //  - Root: 維持 slider 顯示
+    //  - Controller: 處理 domain 更新 (model、scene、notify)
+    //
+    //  - setState(...) 更新 state.model.I
+    //  - controller.onIncomeChange(nextI) 觸發 model/scene 更新 + notify
     // ----------------------------------------------------------
     private handleIncomeChange(nextI: number): void {
-        this.setState({
+        this.setState( (prev) => ({
             model: {
-                ...this.state.model,
+                ...prev.model,
                 I: nextI,
             },
-        });
+        }));
 
         this.props.controller.onIncomeChange(nextI);
     }
@@ -271,12 +308,12 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     //  handleAlphaChange：
     // ----------------------------------------------------------
     private handleAlphaChange(nextAlpha: number): void {
-        this.setState({
+        this.setState( (prev) => ({
             model: {
-                ...this.state.model,
+                ...prev.model,
                 exponent: nextAlpha,
             },
-        });
+        }));
 
         this.props.controller.onAlphaChange(nextAlpha);
     }
@@ -285,12 +322,12 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     //  handlePxChange：
     // ----------------------------------------------------------
     private handlePxChange(nextPx: number): void {
-        this.setState({
+        this.setState( (prev) => ({
             model: {
-                ...this.state.model,
+                ...prev.model,
                 px: nextPx,
             },
-        });
+        }));
 
         this.props.controller.onPxChange(nextPx);
     }
@@ -299,12 +336,12 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     //  handlePyChange：
     // ----------------------------------------------------------
     private handlePyChange(nextPy: number): void {
-        this.setState({
+        this.setState( (prev) => ({
             model: {
-                ...this.state.model,
-                py: nextPy,
+                ...prev.model,
+                px: nextPy,
             },
-        });
+        }));
 
         this.props.controller.onPyChange(nextPy);
     }
@@ -315,21 +352,28 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     // ==========================================================
 
     // ----------------------------------------------------------
-    //  handleChangeTicks: ControlPanel -> AppView -> controller/viewOptions ?????
+    //  handleChangeTicks: 
+    //  ControlPanel -> Root (patch/回呼) → controller（viewOptions 或 model change）
     //  - 控制 ticks 必須在 ALLOWED_TICKS 內
-    //  - AppView 是規則擁有者（ControlsPanel 只是 UI） ??????
+    //
+    //  Input: nextTicks: number (候選 ticks 數量)
+    //
+    //  Output: (void)
+    //  - 合法才 setState 更新 tick.ticks
     // ----------------------------------------------------------
     private handleChangeTicks(nextTicks: number): void {
-        // 防呆機制: 只接受 ALLOWED_TICKS
+        // Validate 防呆機制: 只接受 ALLOWED_TICKS
+        // - 因為 ticks 數量足夠少，因此直接 linear search
         if (!ALLOWED_TICKS.includes(nextTicks)) {
             return;
         }
-        this.setState({
+        // Update
+        this.setState( (prev) => ({
             tick: {
-                ...this.state.tick,
-                ticks: nextTicks,
+                ...prev.tick,
+                px: nextTicks,
             },
-        });
+        }));
     }
 
 
@@ -339,7 +383,15 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
 
     // ----------------------------------------------------------
     //  handleExportClick：
-    //  - 
+    //  - export 是命令式操作，透過 ref 呼叫 GraphView 的方法是合理的，避免將 export pipeline 塞入 state
+    //    - React 中，多數互動操作都為「宣告式 declarative」: 
+    //      改 state -> React 依 state 重新 render -> UI 改變
+    //      但匯出 export 這個動作是一次性且無須持久存在的狀態，因此為了避免觸發重複操作，直接改以命令式操作
+    //
+    //  Input: empty
+    //
+    //  Output: (void)
+    //  - 若 graphRef.current 存在，呼叫 exportSvg(filename)
     // ----------------------------------------------------------
     private handleExportClick(): void {
         const ref = this.graphRef.current;
@@ -354,8 +406,18 @@ export class ConsumerOptRoot extends React.Component<Props, State> {
     //  render：渲染 UI
     //  - 左側：slider 控制
     //  - 右側：ConsumerOptGraphView（圖）
+    //  - Root 的「組裝」責任落點: 將 state 分配給左右兩邊元件
+    //
+    //  Input: empty
+    //  - 讀取 this.state 與 this.props.controller
+    //
+    //  Output: 
+    //  - React element tree:
+    //    - <ConsumerOptControlsPanel ... />
+    //    - <ConsumerOptGraphView ... />
     // ----------------------------------------------------------
     public render(): React.ReactNode {
+        // props shaping: GraphView 不需要整包 tick state，只要 visibility
         const tickVisibility: TickVisibility = {
             showTickLines: this.state.tick.showTickLines,
             showTickLabels: this.state.tick.showTickLabels,

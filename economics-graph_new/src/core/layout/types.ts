@@ -1,4 +1,5 @@
 // src/core/layout/types.ts
+
 // ------------------------------------------------------------
 //  Layout 相關的最小通用型別
 //  - Margin：留白設定（SVG/Canvas 都會用到）
@@ -11,16 +12,16 @@
 // Margin：SVG/畫布留白設定
 // ------------------------------------------------------------
 export type Margin = {
-  top: number;
-  right: number;
-  bottom: number;
-  left: number;
+    top: number;
+    right: number;
+    bottom: number;
+    left: number;
 };
 
 // ------------------------------------------------------------
 // PlotOffset：plot 區在 inner 可用空間內的置中位移
 // ------------------------------------------------------------
 export type PlotOffset = {
-  x: number;
-  y: number;
+    x: number;
+    y: number;
 };

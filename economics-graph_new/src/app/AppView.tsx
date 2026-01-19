@@ -1,51 +1,33 @@
 // src/app/AppView.tsx
 
 // ------------------------------------------------------------
-// AppView：你的「應用程式最上層 View」(React class component)
-// (1) 建立 Model：new ConsumerOptModel(...)
-// (2) 建立 Controller：new ConsumerOptController(...)
-// (3) 建立 GraphView：負責畫圖（訂閱 controller）
-// (4) 建立 ControlsPanel：負責 UI 控制（slider/checkbox/...）
-// (5) 管理「UI state ↔ model/controller」的同步：
-//     - slider 改變：AppView 更新 UI state + 呼叫 controller 更新 model
-//     - 拖曳點改變：controller 更新 model 後 notify，AppView 再把 model 同步回 UI state
-
-// - AppView 是「Composition Root」：負責把 MVC 物件組起來
-// - 它本身仍是 View，但也是 "wiring" 的地方
-
-// 重要更新（React 18 / StrictMode 常見坑）
-// - subscribe 這種「副作用」不要放在 constructor
-// - 要放在 componentDidMount（確保元件真的 mounted 後才訂閱）
-// - 卸載時在 componentWillUnmount 取消訂閱
-// ------------------------------------------------------------
-
-
-// ------------------------------------------------------------
 //  App (App Shell / Composition Root)
-//  目的:
+//  SRP:
 //  - AppView 只負責「App層」的事情:
-//    1) 決定目前 active featureId (未來可做下拉選單 / route / URL)
-//    2) 把 featureId 交給 FeatureHost 掛載
+//    1) 選擇哪個 feature: 決定目前 active featureId (未來可做下拉選單 / route / URL)
+//    2) 從 registry 取得 FeatureModule
+//    3) 建立 controller (once)
+//    2) 把 feature 掛載到畫面: 把 featureId 交給 FeatureHost 掛載，由 feature 組裝 UI
 //
 //  AppView 不再負責:
 //  - import ConsumerOptGraphView / ConsumerOptControlsPanel
 //  - new ConsumerOptController / ConsumerOptModel
 //  - 管理 consumerOpt 的 UI state (轉移到 feature 的 Root)
 //
+//  OCP (對擴充開放、對修改封閉):
 //  - 新增新 feature (供需、賽局、GE)時，不用一直修改 AppView
 //  - UI 重作 (Figma Make)時，AppView 幾乎不用動
 // ------------------------------------------------------------
 
-
 import React from "react";
-
-// // Model：保存參數 + 提供 econ compute
-// import { ConsumerOptModel } from "../features/consumerOpt/model/ConsumerOptModel";
 
 // FeatureRegistry: AppView 不再直接 new controller，而是透過 module 直接建立 (取代 new controller)
 import type { FeatureId } from "../features/types";
+
+// App 層的預設 feature 選擇，features/registry 提供「產品決策」
 import { DEFAULT_FEATURE_ID } from "../features/registry";
 
+// Feature 掛載器: App 將選取的 featureID 傳遞給 FeatureHost，由 FeatureHost 進行「找到 module/建立 controller/mount root UI」
 import { FeatureHost } from "./FeatureHost";
 
 // ------------------------------------------------------------
@@ -58,12 +40,12 @@ type State = {
 
 // ------------------------------------------------------------
 //  AppView
-//  - [CHANGED] [Step2] 進行 wiring 層的 refactor: controller 建立改走 FeatureModule
-//
 //  - React.Component<Props, State> 
 //    - P : props 的型別；S : state 的型別
 //  - props 不需要任何東西，所以用 Record<string, never>
 //   （代表：不允許有任何 props key）
+//    - 這麼設計可以擋掉所又 props 傳遞到 App 層，因為 AppView 是 app shell，
+//      不應該依賴外部 props，違反 SRP
 //
 //  Input:
 //  - props: void (Record<string, never>)
@@ -77,6 +59,11 @@ export default class AppView extends React.Component<
 > {
     // ----------------------------------------------------------
     //  constructor
+    //  
+    //  Input: (隱含 input)
+    //  - this.state.activeFeatureId
+    //
+    //  Output: React.ReactNode
     // ----------------------------------------------------------
     public constructor(props: Record<string, never>) {
         super(props);
@@ -85,7 +72,7 @@ export default class AppView extends React.Component<
             activeFeatureId: DEFAULT_FEATURE_ID,
         };
     }
-
+    // AppView 僅做到這一步，選取 activeFeatureId，並且傳遞下去
     public render(): React.ReactNode {
         return (
             <div style={{ padding: 16 }}>

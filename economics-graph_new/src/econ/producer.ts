@@ -1,4 +1,5 @@
 /* src/econ/producer.ts
+
  * ------------------------------------------------------------
  * Producer / Firm theory calculations (placeholder)
  * 目的：

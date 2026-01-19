@@ -8,7 +8,6 @@
 // 2) 刻度生成邏輯可以被其他圖表重用（未來你不只畫一張圖）
 // 3) 這裡是「純渲染邏輯」：不碰 state / 不碰 model / 不改 controller
 //
-// 重要概念：
 // - 這些函式只回傳 React.ReactNode[]（一堆 JSX）
 // - 誰來 render？AxesView 來 render
 // ------------------------------------------------------------
@@ -132,26 +131,8 @@ export function buildXTicks(args: {
         xTickNodes.push(
             <g key={`xtick-${i}`}>
                 {/* 刻度線：從 X 軸往下畫 tickLen */}
-                {/* <line
-                    x1={xPixel}
-                    y1={xAxisYPixel}
-                    x2={xPixel}
-                    y2={xAxisYPixel + style.tickLen}
-                    stroke="currentColor"
-                    /> */}
-
-                {/* 刻度文字：置中對齊 */}
-                {/* <text
-                    x={xPixel}
-                    y={xAxisYPixel + style.tickLen + style.fontSize}
-                    fontSize={style.fontSize}
-                    textAnchor="middle"
-                    fill="currentColor"
-                    >
-                    {formatTick(xEconVal)}
-                    </text> */}
-
                 {tickLineNode}
+                {/* 刻度文字：置中對齊 */}
                 {tickLabelNode}
             </g>
         );
@@ -232,26 +213,8 @@ export function buildYTicks(args: {
         yTickNodes.push(
             <g key={`ytick-${i}`}>
                 {/* 刻度線：從 Y 軸往左畫 tickLen */}
-                {/* <line
-                    x1={yAxisXPixel}
-                    y1={yPixel}
-                    x2={yAxisXPixel - style.tickLen}
-                    y2={yPixel}
-                    stroke="currentColor"
-                /> */}
-
-                {/* 刻度文字：右對齊貼近 y 軸 */}
-                {/* <text
-                    x={yAxisXPixel - style.tickLen - 2}
-                    y={yPixel + style.fontSize / 3}
-                    fontSize={style.fontSize}
-                    textAnchor="end"
-                    fill="currentColor"
-                >
-                    {formatTick(yEconVal)}
-                </text> */}
-
                 {tickLineNode}
+                {/* 刻度文字：右對齊貼近 y 軸 */}
                 {tickLabelNode}
             </g>
         );
